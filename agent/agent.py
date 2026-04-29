@@ -1,17 +1,18 @@
 """
-Domain Opportunity Agent — Phase 1
-Sources : Expireddomains.net, Namebio, Google Trends, OpenPageRank
+Domain Opportunity Agent — Phase 1 (v2)
+Sources : WhoisXML API (domaines expirés), Namebio, Google Trends (avec retry), OpenPageRank
 Output  : Google Sheets + Gmail alert if score > 80
 """
 
 import os
 import time
 import json
+import random
 import logging
 import requests
 import gspread
 import smtplib
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from bs4 import BeautifulSoup
@@ -24,28 +25,25 @@ log = logging.getLogger(__name__)
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 KEYWORDS = [
-    # FP&A / Reporting
     "fpna", "budgeting", "forecasting", "cashflow", "treasury",
     "consolidation", "reporting", "cfo", "controllers",
-    # Outils / SaaS finance
     "finops", "fintech", "erp", "epm", "automation-finance",
     "close", "reconciliation",
-    # Transformation
     "finance-transformation", "shared-services", "finance-digitale",
-    "business-partner", "digitalization", "demat",
-    # Réglementaire
-    "ifrs",
+    "business-partner", "digitalization", "demat", "ifrs",
 ]
 
-EXTENSIONS    = [".com", ".io", ".fr", ".ai", ".co"]
-BUDGET_MAX    = 200      # € — filtre dur
-SCORE_ALERT   = 80       # seuil email
-SHEET_NAME    = os.getenv("GOOGLE_SHEET_NAME", "Domain Agent")
-GMAIL_FROM    = os.getenv("GMAIL_FROM")
-GMAIL_TO      = os.getenv("GMAIL_TO")
-GMAIL_PASS    = os.getenv("GMAIL_APP_PASSWORD")   # App Password Gmail
-OPR_API_KEY   = os.getenv("OPR_API_KEY", "")      # OpenPageRank
-GCP_CREDS     = os.getenv("GCP_SERVICE_ACCOUNT_JSON")  # JSON string
+EXTENSIONS  = [".com", ".io", ".fr", ".ai", ".co"]
+BUDGET_MAX  = 200
+SCORE_ALERT = 80
+
+SHEET_NAME      = os.getenv("GOOGLE_SHEET_NAME", "Domain Agent")
+GMAIL_FROM      = os.getenv("GMAIL_FROM")
+GMAIL_TO        = os.getenv("GMAIL_TO")
+GMAIL_PASS      = os.getenv("GMAIL_APP_PASSWORD")
+OPR_API_KEY     = os.getenv("OPR_API_KEY", "")
+GCP_CREDS       = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+WHOISXML_KEY    = os.getenv("WHOISXML_API_KEY", "")
 
 HEADERS = {
     "User-Agent": (
@@ -65,8 +63,7 @@ def get_sheet():
     ]
     creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
     gc    = gspread.authorize(creds)
-    sh    = gc.open(SHEET_NAME)
-    return sh
+    return gc.open(SHEET_NAME)
 
 def ensure_sheets(sh):
     existing = [w.title for w in sh.worksheets()]
@@ -91,127 +88,140 @@ def ensure_sheets(sh):
             ws.append_row(headers)
             log.info(f"Feuille créée : {name}")
 
-# ─── Scraping Expireddomains.net ───────────────────────────────────────────────
+# ─── Source 1A : WhoisXML API — domaines expirés ──────────────────────────────
+# Gratuit : 500 requêtes/mois — https://www.whoisxmlapi.com
 
-def fetch_expired_domains(keyword: str) -> list[dict]:
-    """Scrape expireddomains.net pour un mot-clé donné."""
-    url = (
-        f"https://www.expireddomains.net/domain-name-search/"
-        f"?q={keyword}&fwhois=22&ftlds[]=1&ftlds[]=2&ftlds[]=14"
-        f"&fdomainage=1&falexa=1"
-    )
+def fetch_expired_domains_whoisxml(keyword: str) -> list[dict]:
     domains = []
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(r.text, "html.parser")
-        table = soup.find("table", {"class": "base1"})
-        if not table:
-            return domains
-        for row in table.find_all("tr")[1:26]:   # max 25 par keyword
-            cols = row.find_all("td")
-            if len(cols) < 3:
-                continue
-            domain_cell = cols[0].get_text(strip=True)
-            if not domain_cell:
-                continue
-            # Prix affiché (souvent vide = prix d'enregistrement ~10€)
-            price_raw = cols[3].get_text(strip=True) if len(cols) > 3 else ""
-            price = parse_price(price_raw)
-            if price > BUDGET_MAX:
-                continue
-            # Heures restantes aux enchères
-            hours_raw = cols[-2].get_text(strip=True) if len(cols) > 2 else ""
-            hours = parse_hours(hours_raw)
-            ext = next((e for e in EXTENSIONS if domain_cell.endswith(e)), None)
-            if not ext:
-                continue
-            domains.append({
-                "domaine": domain_cell.replace(ext, ""),
-                "extension": ext,
-                "prix_achat_estime": price if price > 0 else 12,
-                "heures_encheres": hours,
-                "lien_godaddy": f"https://www.godaddy.com/domainsearch/find?checkAvail=1&domainToCheck={domain_cell}",
-                "keyword_source": keyword,
-            })
-    except Exception as e:
-        log.warning(f"Expireddomains fetch error ({keyword}): {e}")
+    for ext in [".com", ".io", ".fr"]:
+        tld = ext.replace(".", "")
+        try:
+            r = requests.post(
+                "https://domain-research.whoisxmlapi.com/api/v1",
+                json={
+                    "apiKey": WHOISXML_KEY,
+                    "searchType": "current",
+                    "mode": "purchase",
+                    "basicSearchTerms": {"include": [keyword]},
+                    "filters": [
+                        {"field": "tld", "operator": "equals", "value": tld},
+                    ],
+                },
+                timeout=15,
+            )
+            for item in r.json().get("domainsList", [])[:8]:
+                domain_full = item.get("domainName", "")
+                if not domain_full:
+                    continue
+                name = domain_full.replace(ext, "")
+                domains.append({
+                    "domaine": name,
+                    "extension": ext,
+                    "prix_achat_estime": 12,
+                    "heures_encheres": 168,
+                    "lien_godaddy": f"https://www.godaddy.com/domainsearch/find?checkAvail=1&domainToCheck={domain_full}",
+                    "keyword_source": keyword,
+                })
+            time.sleep(1)
+        except Exception as e:
+            log.warning(f"WhoisXML error ({keyword}{ext}): {e}")
     return domains
 
-def parse_price(raw: str) -> float:
-    raw = raw.replace("$", "").replace("€", "").replace(",", "").strip()
-    try:
-        return float(raw)
-    except Exception:
-        return 0.0
+# ─── Source 1B : Fallback RDAP — disponibilité sans API payante ───────────────
 
-def parse_hours(raw: str) -> int:
-    """Convertit '2d 4h' ou '48h' en heures."""
-    raw = raw.lower()
-    hours = 0
-    if "d" in raw:
-        parts = raw.split("d")
+def fetch_expired_domains_fallback(keyword: str) -> list[dict]:
+    """
+    Génère des combinaisons domaine + mot-clé et vérifie la disponibilité
+    via l'API RDAP publique (aucune clé requise, légal).
+    """
+    prefixes = ["get", "my", "use", "go", "the", "pro", "be", ""]
+    suffixes = ["hq", "app", "hub", "ai", "pro", "ly", "now", ""]
+    domains  = []
+    kw       = keyword.replace("-", "")
+
+    candidates = []
+    for pre in prefixes[:4]:
+        for suf in suffixes[:3]:
+            for ext in [".com", ".io", ".fr"]:
+                name = f"{pre}{kw}{suf}".strip()
+                if 4 <= len(name) <= 22:
+                    candidates.append((name, ext))
+
+    random.shuffle(candidates)
+    for name, ext in candidates[:15]:
+        domain_full = name + ext
         try:
-            hours += int(parts[0].strip()) * 24
+            r = requests.get(
+                f"https://rdap.org/domain/{domain_full}",
+                timeout=8, headers=HEADERS
+            )
+            if r.status_code == 404:
+                domains.append({
+                    "domaine": name,
+                    "extension": ext,
+                    "prix_achat_estime": 12,
+                    "heures_encheres": 720,
+                    "lien_godaddy": f"https://www.godaddy.com/domainsearch/find?checkAvail=1&domainToCheck={domain_full}",
+                    "keyword_source": keyword,
+                })
+            time.sleep(0.5)
         except Exception:
             pass
-        raw = parts[1] if len(parts) > 1 else ""
-    if "h" in raw:
-        try:
-            hours += int(raw.replace("h", "").strip())
-        except Exception:
-            pass
-    return hours if hours > 0 else 168   # défaut 7 jours
 
-# ─── Namebio — ventes similaires ──────────────────────────────────────────────
+    log.info(f"Fallback RDAP ({keyword}) → {len(domains)} domaines disponibles")
+    return domains
+
+# ─── Source 2 : Namebio — historique de ventes ────────────────────────────────
 
 def fetch_namebio_sales(keyword: str) -> list[dict]:
-    url = f"https://namebio.com/?s={keyword}"
     sales = []
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
+        r    = requests.get(f"https://namebio.com/?s={keyword}", headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
-        rows = soup.select("table.table tbody tr")[:10]
-        for row in rows:
-            cols = row.find_all("td")
+        for row in soup.select("table.table tbody tr")[:10]:
+            cols  = row.find_all("td")
             if len(cols) < 3:
                 continue
-            domain = cols[0].get_text(strip=True)
-            price  = parse_price(cols[1].get_text(strip=True))
-            date   = cols[2].get_text(strip=True)
+            price = parse_price(cols[1].get_text(strip=True))
             if price > 0:
-                sales.append({"domain": domain, "price": price, "date": date})
+                sales.append({"price": price, "date": cols[2].get_text(strip=True)})
     except Exception as e:
         log.warning(f"Namebio error ({keyword}): {e}")
     return sales
 
-# ─── Google Trends ─────────────────────────────────────────────────────────────
-
-_pytrends = TrendReq(hl="fr-FR", tz=60, timeout=(10, 25))
+# ─── Source 3 : Google Trends — avec retry et backoff ─────────────────────────
 
 def get_trend_score(keyword: str) -> int:
-    """Retourne un score 0-100 basé sur la tendance des 90 derniers jours."""
-    try:
-        kw = keyword.replace("-", " ")
-        _pytrends.build_payload([kw], cat=0, timeframe="today 3-m", geo="")
-        df = _pytrends.interest_over_time()
-        if df.empty:
-            return 0
-        avg   = int(df[kw].mean())
-        trend = int(df[kw].iloc[-4:].mean() - df[kw].iloc[:4].mean())
-        score = min(100, avg + max(0, trend * 2))
-        return score
-    except Exception as e:
-        log.warning(f"Trends error ({keyword}): {e}")
-        return 0
+    kw      = keyword.replace("-", " ")
+    retries = 3
+    for attempt in range(retries):
+        try:
+            pt = TrendReq(hl="fr-FR", tz=60, timeout=(10, 25),
+                          retries=2, backoff_factor=0.5)
+            pt.build_payload([kw], cat=0, timeframe="today 3-m", geo="")
+            df = pt.interest_over_time()
+            if df.empty:
+                return 0
+            avg   = int(df[kw].mean())
+            delta = int(df[kw].iloc[-4:].mean() - df[kw].iloc[:4].mean())
+            return min(100, avg + max(0, delta * 2))
+        except Exception as e:
+            if "429" in str(e) and attempt < retries - 1:
+                wait = (2 ** attempt) * 10 + random.randint(5, 15)
+                log.warning(f"Trends 429 ({keyword}) — attente {wait}s")
+                time.sleep(wait)
+            else:
+                log.warning(f"Trends error ({keyword}): {e}")
+                return 0
+    return 0
 
-# ─── OpenPageRank ──────────────────────────────────────────────────────────────
+# ─── Source 4 : OpenPageRank — backlinks ──────────────────────────────────────
 
 def get_backlinks_score(domain_full: str) -> tuple[int, int]:
-    """Retourne (score 0-100, nb_backlinks estimé)."""
     if not OPR_API_KEY:
         return 0, 0
     try:
-        r = requests.get(
+        r    = requests.get(
             "https://openpagerank.com/api/v1.0/getPageRank",
             params={"domains[]": domain_full},
             headers={"API-OPR": OPR_API_KEY},
@@ -220,75 +230,63 @@ def get_backlinks_score(domain_full: str) -> tuple[int, int]:
         data = r.json()
         rank = data["response"][0].get("page_rank_integer", 0)
         bl   = data["response"][0].get("rank", 0)
-        score = min(100, rank * 12)   # PageRank 0-10 → score 0-100 (env.)
-        return score, bl
+        return min(100, rank * 12), bl
     except Exception as e:
         log.warning(f"OPR error ({domain_full}): {e}")
         return 0, 0
 
-# ─── Scoring ───────────────────────────────────────────────────────────────────
+# ─── Utilitaires ──────────────────────────────────────────────────────────────
+
+def parse_price(raw: str) -> float:
+    raw = raw.replace("$", "").replace("€", "").replace(",", "").strip()
+    try:
+        return float(raw)
+    except Exception:
+        return 0.0
+
+# ─── Scoring ──────────────────────────────────────────────────────────────────
 
 def score_domain(domain: dict, sales: list[dict], trend: int) -> dict:
-    """
-    5 dimensions pondérées :
-      marché    30% — ventes similaires récentes
-      acheteur  25% — pertinence niche finance
-      demande   20% — Google Trends
-      seo       15% — backlinks hérités
-      timing    10% — heures restantes enchères
-    """
     name = domain["domaine"].lower()
     ext  = domain["extension"]
 
-    # --- Score marché (30%) ---
+    # Marché (30%)
     avg_sale = (sum(s["price"] for s in sales) / len(sales)) if sales else 0
     s_marche = 0
     if avg_sale > 0:
         ratio    = avg_sale / max(domain["prix_achat_estime"], 1)
         s_marche = min(100, int(ratio * 15))
-    nb_ventes = len(sales)
-    s_marche  = min(100, s_marche + nb_ventes * 5)
+    s_marche = min(100, s_marche + len(sales) * 5)
 
-    # --- Score acheteur (25%) ---
-    # Bonus si le nom correspond à un mot-clé finance de haute valeur
-    high_value = {"ifrs", "fpna", "cfo", "treasury", "finops", "erp", "epm",
-                  "consolidation", "close", "demat", "digitalization"}
+    # Acheteur (25%)
+    high_value   = {"ifrs", "fpna", "cfo", "treasury", "finops", "erp", "epm",
+                    "consolidation", "close", "demat", "digitalization"}
     medium_value = {"budgeting", "forecasting", "cashflow", "reporting",
                     "controllers", "fintech", "reconciliation",
-                    "finance-transformation", "shared-services"}
+                    "financetransformation", "sharedservices"}
     if any(k in name for k in high_value):
         s_acheteur = 90
     elif any(k in name for k in medium_value):
         s_acheteur = 65
     else:
         s_acheteur = 35
-    # Bonus .com / .io
-    if ext == ".com":
-        s_acheteur = min(100, s_acheteur + 10)
-    elif ext in (".io", ".ai"):
-        s_acheteur = min(100, s_acheteur + 5)
+    if ext == ".com":   s_acheteur = min(100, s_acheteur + 10)
+    elif ext in (".io", ".ai"): s_acheteur = min(100, s_acheteur + 5)
 
-    # --- Score demande (20%) ---
-    s_demande = trend   # déjà 0-100
+    # Demande (20%)
+    s_demande = trend
 
-    # --- Score SEO (15%) ---
-    seo_score, nb_backlinks = get_backlinks_score(name + ext)
-    s_seo = seo_score
+    # SEO (15%)
+    s_seo, nb_backlinks = get_backlinks_score(name + ext)
 
-    # --- Score timing (10%) ---
+    # Timing (10%)
     h = domain["heures_encheres"]
-    if h <= 24:
-        s_timing = 100
-    elif h <= 48:
-        s_timing = 80
-    elif h <= 72:
-        s_timing = 60
-    elif h <= 168:
-        s_timing = 40
-    else:
-        s_timing = 20
+    if h <= 24:    s_timing = 100
+    elif h <= 48:  s_timing = 80
+    elif h <= 72:  s_timing = 60
+    elif h <= 168: s_timing = 40
+    else:          s_timing = 20
 
-    # --- Agrégation ---
     score_global = int(
         s_marche   * 0.30 +
         s_acheteur * 0.25 +
@@ -297,34 +295,31 @@ def score_domain(domain: dict, sales: list[dict], trend: int) -> dict:
         s_timing   * 0.10
     )
 
-    # --- Rationale ---
-    rationale_parts = []
+    parts = []
     if avg_sale > 0:
-        rationale_parts.append(
-            f"{nb_ventes} ventes similaires récentes (moy. {avg_sale:.0f}€)"
-        )
+        parts.append(f"{len(sales)} ventes similaires (moy. {avg_sale:.0f}€)")
     if s_acheteur >= 80:
-        rationale_parts.append("mot-clé finance à haute valeur acheteur")
+        parts.append("mot-clé finance haute valeur")
     if trend >= 60:
-        rationale_parts.append(f"tendance Google en hausse ({trend}/100)")
+        parts.append(f"tendance Google {trend}/100")
     if nb_backlinks > 0:
-        rationale_parts.append(f"{nb_backlinks} backlinks hérités")
+        parts.append(f"{nb_backlinks} backlinks hérités")
     if h <= 48:
-        rationale_parts.append(f"enchère se termine dans {h}h — urgence")
-    rationale = " · ".join(rationale_parts) if rationale_parts else "Opportunité générique niche finance"
+        parts.append(f"enchère dans {h}h")
+    rationale = " · ".join(parts) if parts else "Domaine disponible niche finance"
 
     return {
         **domain,
-        "score_global":    score_global,
-        "score_marche":    s_marche,
-        "score_acheteur":  s_acheteur,
-        "score_demande":   s_demande,
-        "score_seo":       s_seo,
-        "score_timing":    s_timing,
-        "backlinks":       nb_backlinks,
-        "tendance":        trend,
-        "ventes_similaires": nb_ventes,
-        "rationale":       rationale,
+        "score_global":      score_global,
+        "score_marche":      s_marche,
+        "score_acheteur":    s_acheteur,
+        "score_demande":     s_demande,
+        "score_seo":         s_seo,
+        "score_timing":      s_timing,
+        "backlinks":         nb_backlinks,
+        "tendance":          trend,
+        "ventes_similaires": len(sales),
+        "rationale":         rationale,
     }
 
 # ─── Email ─────────────────────────────────────────────────────────────────────
@@ -333,7 +328,7 @@ def send_alert(opportunities: list[dict]):
     if not (GMAIL_FROM and GMAIL_TO and GMAIL_PASS):
         log.warning("Gmail non configuré — alerte ignorée")
         return
-    top = sorted(opportunities, key=lambda x: x["score_global"], reverse=True)[:5]
+    top  = sorted(opportunities, key=lambda x: x["score_global"], reverse=True)[:5]
     rows = ""
     for o in top:
         rows += f"""
@@ -342,7 +337,8 @@ def send_alert(opportunities: list[dict]):
             <strong>{o['domaine']}{o['extension']}</strong>
           </td>
           <td style="padding:8px;border-bottom:1px solid #eee;text-align:center">
-            <span style="background:#EAF3DE;color:#27500A;padding:3px 10px;border-radius:12px;font-weight:bold">
+            <span style="background:#EAF3DE;color:#27500A;padding:3px 10px;
+                         border-radius:12px;font-weight:bold">
               {o['score_global']}/100
             </span>
           </td>
@@ -374,14 +370,17 @@ def send_alert(opportunities: list[dict]):
         <tbody>{rows}</tbody>
       </table>
       <p style="color:#999;font-size:12px;margin-top:20px">
-        Domain Agent · Scan automatique · Ne pas répondre à cet email
+        Domain Agent · Scan automatique
       </p>
     </body></html>"""
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"[Domain Agent] {len(top)} opportunité(s) score > {SCORE_ALERT} — {datetime.now().strftime('%d/%m %Hh')}"
-    msg["From"]    = GMAIL_FROM
-    msg["To"]      = GMAIL_TO
+    msg            = MIMEMultipart("alternative")
+    msg["Subject"] = (
+        f"[Domain Agent] {len(top)} opportunité(s) score > {SCORE_ALERT}"
+        f" — {datetime.now().strftime('%d/%m %Hh')}"
+    )
+    msg["From"] = GMAIL_FROM
+    msg["To"]   = GMAIL_TO
     msg.attach(MIMEText(html, "html"))
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
@@ -394,60 +393,58 @@ def send_alert(opportunities: list[dict]):
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
-    log.info("=== Démarrage scan domain agent ===")
+    log.info("=== Démarrage scan domain agent v2 ===")
     sh = get_sheet()
     ensure_sheets(sh)
     ws = sh.worksheet("opportunites")
 
     all_domains: list[dict] = []
-    seen: set[str] = set()
+    seen: set[str]          = set()
 
     for kw in KEYWORDS:
-        log.info(f"Scraping keyword : {kw}")
-        domains = fetch_expired_domains(kw)
-        sales   = fetch_namebio_sales(kw)
-        trend   = get_trend_score(kw)
-        time.sleep(2)   # politesse scraping
+        log.info(f"Traitement keyword : {kw}")
+
+        # Source 1 : domaines disponibles
+        if WHOISXML_KEY:
+            domains = fetch_expired_domains_whoisxml(kw)
+        else:
+            domains = fetch_expired_domains_fallback(kw)
+
+        # Source 2 : historique ventes
+        sales = fetch_namebio_sales(kw)
+
+        # Source 3 : tendance (pause anti-429)
+        time.sleep(random.randint(8, 15))
+        trend = get_trend_score(kw)
 
         for d in domains:
             key = d["domaine"] + d["extension"]
             if key in seen:
                 continue
             seen.add(key)
-            scored = score_domain(d, sales, trend)
-            all_domains.append(scored)
+            all_domains.append(score_domain(d, sales, trend))
 
-    # Tri par score décroissant
+        time.sleep(2)
+
     all_domains.sort(key=lambda x: x["score_global"], reverse=True)
 
-    # Écriture Google Sheets
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now           = datetime.now().strftime("%Y-%m-%d %H:%M")
     rows_to_write = []
-    for o in all_domains[:50]:   # top 50 max
+    for o in all_domains[:50]:
         rows_to_write.append([
-            now,
-            o["domaine"],
-            o["extension"],
-            o["prix_achat_estime"],
-            o["score_global"],
-            o["score_marche"],
-            o["score_acheteur"],
-            o["score_demande"],
-            o["score_seo"],
-            o["score_timing"],
-            o["backlinks"],
-            o["tendance"],
-            o["ventes_similaires"],
-            o["heures_encheres"],
-            o["rationale"],
-            o["lien_godaddy"],
+            now, o["domaine"], o["extension"], o["prix_achat_estime"],
+            o["score_global"], o["score_marche"], o["score_acheteur"],
+            o["score_demande"], o["score_seo"], o["score_timing"],
+            o["backlinks"], o["tendance"], o["ventes_similaires"],
+            o["heures_encheres"], o["rationale"], o["lien_godaddy"],
         ])
 
     if rows_to_write:
         ws.append_rows(rows_to_write, value_input_option="RAW")
         log.info(f"{len(rows_to_write)} opportunités écrites dans Google Sheets")
+    else:
+        log.warning("Aucun domaine trouvé — vérifie les sources de données")
 
-    # Alertes email — score > seuil
     top_alerts = [o for o in all_domains if o["score_global"] >= SCORE_ALERT]
     if top_alerts:
         log.info(f"{len(top_alerts)} domaine(s) déclenchent une alerte email")
