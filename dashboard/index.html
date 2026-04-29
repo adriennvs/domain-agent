@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Domain Agent — Dashboard</title>
+<style>
+  :root {
+    --bg: #fafafa; --surface: #fff; --border: #e8e8e8;
+    --text: #1a1a1a; --muted: #888; --accent: #185FA5;
+    --green-bg: #EAF3DE; --green-text: #27500A;
+    --amber-bg: #FAEEDA; --amber-text: #633806;
+    --gray-bg:  #F1EFE8; --gray-text:  #444441;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); font-size: 14px; }
+  header { background: var(--surface); border-bottom: 1px solid var(--border);
+           padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+  header h1 { font-size: 17px; font-weight: 600; }
+  header p  { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .last-scan { font-size: 12px; color: var(--muted); text-align: right; }
+  .metrics { display: grid; grid-template-columns: repeat(4, 1fr);
+             gap: 12px; padding: 20px 24px 0; }
+  .metric { background: var(--surface); border: 1px solid var(--border);
+            border-radius: 10px; padding: 14px 16px; }
+  .metric .label { font-size: 11px; color: var(--muted); text-transform: uppercase;
+                   letter-spacing: .5px; margin-bottom: 6px; }
+  .metric .value { font-size: 24px; font-weight: 600; }
+  .metric .sub   { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .section { padding: 20px 24px; }
+  .section h2 { font-size: 14px; font-weight: 600; margin-bottom: 12px;
+                display: flex; align-items: center; gap: 8px; }
+  .badge-count { background: var(--accent); color: #fff; border-radius: 20px;
+                 padding: 1px 8px; font-size: 11px; font-weight: 500; }
+  table { width: 100%; border-collapse: collapse; background: var(--surface);
+          border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  thead tr { background: #f5f5f5; }
+  th { padding: 10px 12px; text-align: left; font-size: 11px; font-weight: 600;
+       text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+  td { padding: 10px 12px; border-top: 1px solid var(--border); vertical-align: middle; }
+  tr:hover td { background: #f9f9f9; }
+  .domain-name { font-weight: 600; font-size: 14px; }
+  .domain-ext  { color: var(--muted); font-size: 12px; }
+  .score { display: inline-block; padding: 3px 10px; border-radius: 20px;
+           font-size: 12px; font-weight: 600; }
+  .score-high   { background: var(--green-bg); color: var(--green-text); }
+  .score-mid    { background: var(--amber-bg); color: var(--amber-text); }
+  .score-low    { background: var(--gray-bg);  color: var(--gray-text); }
+  .score-bars   { display: flex; gap: 3px; margin-top: 4px; }
+  .bar          { height: 4px; border-radius: 2px; flex: 1; background: #eee; }
+  .bar.filled   { background: var(--accent); }
+  .rationale    { font-size: 12px; color: var(--muted); max-width: 280px; }
+  .link-btn     { display: inline-block; padding: 4px 10px; border: 1px solid var(--border);
+                  border-radius: 6px; font-size: 12px; color: var(--accent);
+                  text-decoration: none; white-space: nowrap; }
+  .link-btn:hover { background: #f0f7ff; }
+  .countdown    { font-size: 12px; font-weight: 600; }
+  .countdown.urgent { color: #D85A30; }
+  .filters { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .filter-btn { padding: 5px 12px; border: 1px solid var(--border);
+                border-radius: 20px; font-size: 12px; cursor: pointer;
+                background: var(--surface); color: var(--text); }
+  .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .empty { text-align: center; padding: 40px; color: var(--muted); }
+  .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border);
+          padding: 0 24px; background: var(--surface); }
+  .tab { padding: 12px 16px; font-size: 13px; cursor: pointer;
+         border-bottom: 2px solid transparent; color: var(--muted); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 500; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .setup-box { background: #fff8e6; border: 1px solid #f0d080; border-radius: 10px;
+               padding: 16px 20px; margin: 20px 24px; font-size: 13px; line-height: 1.7; }
+  .setup-box h3 { font-size: 14px; margin-bottom: 8px; }
+  .setup-box code { background: #f0ece0; padding: 1px 5px; border-radius: 4px;
+                    font-family: monospace; font-size: 12px; }
+  @media (max-width: 700px) {
+    .metrics { grid-template-columns: 1fr 1fr; }
+    .rationale { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Domain Agent</h1>
+    <p>Opportunités d'achat — niche finance</p>
+  </div>
+  <div class="last-scan">
+    <div id="last-scan-time">—</div>
+    <div style="margin-top:4px">
+      <button onclick="loadData()" style="font-size:12px;padding:4px 10px;cursor:pointer;
+        border:1px solid #ddd;border-radius:6px;background:#fff">
+        Actualiser
+      </button>
+    </div>
+  </div>
+</header>
+
+<div class="metrics">
+  <div class="metric">
+    <div class="label">Opportunités today</div>
+    <div class="value" id="m-total">—</div>
+    <div class="sub">tous scores confondus</div>
+  </div>
+  <div class="metric">
+    <div class="label">Score > 80</div>
+    <div class="value" id="m-high">—</div>
+    <div class="sub">alertes email envoyées</div>
+  </div>
+  <div class="metric">
+    <div class="label">Enchères urgentes</div>
+    <div class="value" id="m-urgent">—</div>
+    <div class="sub">se terminent < 48h</div>
+  </div>
+  <div class="metric">
+    <div class="label">Prix moyen</div>
+    <div class="value" id="m-price">—</div>
+    <div class="sub">estimation achat</div>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('opportunites')">Opportunités</div>
+  <div class="tab" onclick="switchTab('portefeuille')">Portefeuille</div>
+  <div class="tab" onclick="switchTab('setup')">Setup</div>
+</div>
+
+<!-- TAB : Opportunités -->
+<div id="tab-opportunites" class="tab-content active">
+  <div class="section">
+    <h2>Top opportunités <span class="badge-count" id="badge-count">0</span></h2>
+    <div class="filters">
+      <button class="filter-btn active" onclick="setFilter('all', this)">Tous</button>
+      <button class="filter-btn" onclick="setFilter('high', this)">Score > 80</button>
+      <button class="filter-btn" onclick="setFilter('urgent', this)">Enchères < 48h</button>
+      <button class="filter-btn" onclick="setFilter('com', this)">.com uniquement</button>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Domaine</th>
+          <th>Score</th>
+          <th>Dimensions</th>
+          <th>Prix achat</th>
+          <th>Enchère</th>
+          <th>Rationale</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="opp-tbody">
+        <tr><td colspan="7" class="empty">Chargement...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- TAB : Portefeuille -->
+<div id="tab-portefeuille" class="tab-content">
+  <div class="section">
+    <h2>Mon portefeuille</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Domaine</th>
+          <th>Date achat</th>
+          <th>Prix achat</th>
+          <th>Plateforme vente</th>
+          <th>Prix demandé</th>
+          <th>Statut</th>
+          <th>P&L</th>
+        </tr>
+      </thead>
+      <tbody id="port-tbody">
+        <tr><td colspan="7" class="empty">Aucun domaine en portefeuille</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- TAB : Setup -->
+<div id="tab-setup" class="tab-content">
+  <div class="setup-box">
+    <h3>Guide de configuration — 4 étapes</h3>
+
+    <p><strong>1. Google Sheets API</strong><br>
+    Crée un projet sur <a href="https://console.cloud.google.com" target="_blank">console.cloud.google.com</a>
+    → Active "Google Sheets API" + "Google Drive API"
+    → Crée un compte de service → Télécharge le JSON
+    → Partage ton Google Sheet avec l'email du compte de service</p>
+
+    <p style="margin-top:10px"><strong>2. Gmail App Password</strong><br>
+    Google Account → Sécurité → Validation en 2 étapes → Mots de passe des applications
+    → Génère un mot de passe pour "Domain Agent"</p>
+
+    <p style="margin-top:10px"><strong>3. OpenPageRank (gratuit)</strong><br>
+    Inscription sur <a href="https://www.domcop.com/openpagerank/signup" target="_blank">domcop.com/openpagerank</a>
+    → Récupère ta clé API gratuite (100 req/jour)</p>
+
+    <p style="margin-top:10px"><strong>4. GitHub Secrets</strong><br>
+    Repo → Settings → Secrets and variables → Actions → New repository secret<br>
+    Ajoute : <code>GOOGLE_SHEET_NAME</code> · <code>GCP_SERVICE_ACCOUNT_JSON</code>
+    · <code>GMAIL_FROM</code> · <code>GMAIL_TO</code>
+    · <code>GMAIL_APP_PASSWORD</code> · <code>OPR_API_KEY</code></p>
+
+    <p style="margin-top:10px"><strong>Dashboard — connecte ton Google Sheet</strong><br>
+    Remplace <code>SHEET_CSV_URL</code> dans ce fichier par l'URL CSV public de ton sheet :<br>
+    Fichier → Partager → Publier sur le web → Feuille "opportunites" → CSV → Copier le lien</p>
+  </div>
+</div>
+
+<script>
+const SHEET_CSV_URL = "REMPLACE_PAR_TON_URL_CSV_GOOGLE_SHEETS";
+
+let allData = [];
+let currentFilter = "all";
+
+async function loadData() {
+  document.getElementById("last-scan-time").textContent = "Chargement...";
+  try {
+    const r = await fetch(SHEET_CSV_URL + "&t=" + Date.now());
+    const text = await r.text();
+    const rows = parseCSV(text);
+    if (rows.length < 2) { showEmpty(); return; }
+    const headers = rows[0];
+    allData = rows.slice(1).map(row => {
+      const o = {};
+      headers.forEach((h, i) => o[h.trim()] = (row[i] || "").trim());
+      return o;
+    }).filter(o => o.domaine);
+    renderOpportunities();
+    renderPortfolio();
+    updateMetrics();
+    const lastDate = allData[0]?.date_scan || "—";
+    document.getElementById("last-scan-time").textContent = "Dernier scan : " + lastDate;
+  } catch(e) {
+    document.getElementById("last-scan-time").textContent = "Erreur de chargement";
+    document.getElementById("opp-tbody").innerHTML =
+      `<tr><td colspan="7" class="empty">
+        Configure d'abord le Google Sheet (onglet Setup)
+      </td></tr>`;
+  }
+}
+
+function parseCSV(text) {
+  return text.split("\n").map(line => {
+    const result = []; let cur = ""; let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      if (line[i] === '"') { inQ = !inQ; }
+      else if (line[i] === ',' && !inQ) { result.push(cur); cur = ""; }
+      else { cur += line[i]; }
+    }
+    result.push(cur);
+    return result;
+  });
+}
+
+function setFilter(f, btn) {
+  currentFilter = f;
+  document.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  renderOpportunities();
+}
+
+function filterData() {
+  return allData.filter(o => {
+    const score = parseInt(o.score_global) || 0;
+    const hours = parseInt(o.heures_encheres) || 999;
+    const ext = o.extension || "";
+    if (currentFilter === "high") return score >= 80;
+    if (currentFilter === "urgent") return hours <= 48;
+    if (currentFilter === "com") return ext === ".com";
+    return true;
+  }).slice(0, 30);
+}
+
+function scoreClass(s) {
+  if (s >= 80) return "score-high";
+  if (s >= 60) return "score-mid";
+  return "score-low";
+}
+
+function scoreBars(o) {
+  const dims = [
+    { key: "score_marche",   label: "M" },
+    { key: "score_acheteur", label: "A" },
+    { key: "score_demande",  label: "D" },
+    { key: "score_seo",      label: "S" },
+    { key: "score_timing",   label: "T" },
+  ];
+  return `<div class="score-bars" title="Marché·Acheteur·Demande·SEO·Timing">
+    ${dims.map(d => {
+      const v = parseInt(o[d.key]) || 0;
+      const filled = Math.round(v / 20);
+      return Array.from({length: 5}, (_, i) =>
+        `<div class="bar ${i < filled ? 'filled' : ''}"></div>`
+      ).join("");
+    }).join('<div style="width:4px"></div>')}
+  </div>`;
+}
+
+function renderOpportunities() {
+  const data = filterData();
+  document.getElementById("badge-count").textContent = data.length;
+  if (!data.length) {
+    document.getElementById("opp-tbody").innerHTML =
+      '<tr><td colspan="7" class="empty">Aucune opportunité pour ce filtre</td></tr>';
+    return;
+  }
+  document.getElementById("opp-tbody").innerHTML = data.map(o => {
+    const score = parseInt(o.score_global) || 0;
+    const hours = parseInt(o.heures_encheres) || 0;
+    const urgentClass = hours <= 48 ? "urgent" : "";
+    const hoursLabel = hours <= 48 ? `⚡ ${hours}h` : hours <= 168 ? `${Math.round(hours/24)}j` : "+7j";
+    return `<tr>
+      <td>
+        <span class="domain-name">${o.domaine}</span>
+        <span class="domain-ext">${o.extension}</span>
+      </td>
+      <td>
+        <span class="score ${scoreClass(score)}">${score}/100</span>
+        ${scoreBars(o)}
+      </td>
+      <td style="font-size:12px;color:#666">
+        M:${o.score_marche} A:${o.score_acheteur}<br>
+        D:${o.score_demande} S:${o.score_seo} T:${o.score_timing}
+      </td>
+      <td style="font-weight:500">~${o.prix_achat_estime}€</td>
+      <td class="countdown ${urgentClass}">${hoursLabel}</td>
+      <td class="rationale">${o.rationale}</td>
+      <td><a href="${o.lien_godaddy}" target="_blank" class="link-btn">Voir →</a></td>
+    </tr>`;
+  }).join("");
+}
+
+function renderPortfolio() {
+  // Portefeuille vide par défaut — sera alimenté manuellement dans Google Sheets
+  document.getElementById("port-tbody").innerHTML =
+    '<tr><td colspan="7" class="empty">Ajoute tes achats dans l\'onglet "portefeuille" de Google Sheets</td></tr>';
+}
+
+function updateMetrics() {
+  const today = new Date().toISOString().slice(0, 10);
+  const todayData = allData.filter(o => (o.date_scan || "").startsWith(today));
+  document.getElementById("m-total").textContent = todayData.length || allData.length;
+  document.getElementById("m-high").textContent =
+    allData.filter(o => parseInt(o.score_global) >= 80).length;
+  document.getElementById("m-urgent").textContent =
+    allData.filter(o => parseInt(o.heures_encheres) <= 48).length;
+  const prices = allData.map(o => parseFloat(o.prix_achat_estime)).filter(p => p > 0);
+  const avg = prices.length ? Math.round(prices.reduce((a, b) => a + b) / prices.length) : 0;
+  document.getElementById("m-price").textContent = avg ? avg + "€" : "—";
+}
+
+function showEmpty() {
+  document.getElementById("opp-tbody").innerHTML =
+    '<tr><td colspan="7" class="empty">Aucune donnée — configure d\'abord l\'agent (onglet Setup)</td></tr>';
+}
+
+function switchTab(name) {
+  document.querySelectorAll(".tab").forEach((t, i) => {
+    const tabs = ["opportunites", "portefeuille", "setup"];
+    t.classList.toggle("active", tabs[i] === name);
+  });
+  document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
+  document.getElementById("tab-" + name).classList.add("active");
+}
+
+loadData();
+setInterval(loadData, 5 * 60 * 1000); // Rafraîchissement auto toutes les 5 min
+</script>
+</body>
+</html>
