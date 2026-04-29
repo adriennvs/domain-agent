@@ -1,9 +1,7 @@
 """
-Domain Opportunity Agent — v4
-Logique : détecter les inefficiences de marché (ratio valeur/prix)
-Sources  : DNJournal (ventes premium), Namebio (ventes similaires),
-           RDAP (disponibilité), Google Trends, OpenPageRank
-Scoring  : ratio valeur/prix 40% · liquidité 25% · tendance 20% · SEO 15%
+Domain Opportunity Agent — v5
+Fix : DNJournal parsing revu + Namebio recherches génériques multiples
+Logique : ventes récentes → variantes disponibles → ratio valeur/prix
 """
 
 import os
@@ -26,10 +24,10 @@ log = logging.getLogger(__name__)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-BUDGET_MAX   = 200      # € — filtre dur sur le prix d'achat
-SCORE_ALERT  = 75       # seuil déclenchement email (abaissé car scoring revu)
-MIN_SALE     = 300      # € — on ignore les ventes < 300€ sur DNJournal/Namebio
-MAX_VARIANTS = 12       # nb de variantes générées par domaine source
+BUDGET_MAX   = 200
+SCORE_ALERT  = 70
+MIN_SALE     = 300      # € — ventes de référence minimum
+MAX_VARIANTS = 10       # variantes par domaine source
 
 SHEET_NAME   = os.getenv("GOOGLE_SHEET_NAME", "Domain Agent")
 GMAIL_FROM   = os.getenv("GMAIL_FROM")
@@ -45,6 +43,15 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     )
 }
+
+# Mots-clés génériques pour sourcer des ventes récentes sur Namebio
+# Couvre tous les secteurs — pas de biais thématique
+SEED_KEYWORDS = [
+    "tech", "ai", "cloud", "data", "app", "hub", "pro",
+    "shop", "pay", "go", "get", "my", "lab", "io",
+    "health", "legal", "trade", "market", "digital",
+    "smart", "fast", "easy", "live", "real",
+]
 
 # ─── Google Sheets ─────────────────────────────────────────────────────────────
 
@@ -76,7 +83,7 @@ def ensure_sheets(sh):
             "prix_demande", "statut", "date_vente", "prix_vente", "pnl"
         ]),
         ("ventes_reference", [
-            "date_collecte", "domaine", "prix_vente", "source", "secteur_estime"
+            "date_collecte", "domaine", "prix_vente", "source"
         ]),
     ]:
         if name not in existing:
@@ -84,164 +91,139 @@ def ensure_sheets(sh):
             ws.append_row(headers)
             log.info(f"Feuille créée : {name}")
 
-# ─── Source 1 : DNJournal — ventes premium ────────────────────────────────────
+# ─── Source : Namebio — ventes récentes par mot-clé seed ─────────────────────
 
-def fetch_dnjournal_sales() -> list[dict]:
+def fetch_namebio_sales_for_keyword(keyword: str) -> list[dict]:
     """
-    Scrape DNJournal weekly sales chart.
-    Retourne les ventes récentes avec domaine + prix.
-    """
-    sales = []
-    urls  = [
-        "https://www.dnjournal.com/ytd-sales-charts.htm",
-        "https://www.dnjournal.com/archive/domainsales/2024/20241231.htm",
-    ]
-    for url in urls:
-        try:
-            r    = requests.get(url, headers=HEADERS, timeout=15)
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            # DNJournal structure : tableaux avec colonnes Domain / Price
-            for table in soup.find_all("table"):
-                rows = table.find_all("tr")
-                for row in rows[1:]:
-                    cols = row.find_all("td")
-                    if len(cols) < 2:
-                        continue
-                    domain_raw = cols[0].get_text(strip=True).lower()
-                    price_raw  = cols[1].get_text(strip=True)
-                    price      = parse_price(price_raw)
-                    if price < MIN_SALE:
-                        continue
-                    # Nettoie le domaine
-                    domain_clean = re.sub(r"[^a-z0-9.\-]", "", domain_raw)
-                    if "." not in domain_clean or len(domain_clean) < 4:
-                        continue
-                    sales.append({
-                        "domaine_full": domain_clean,
-                        "prix":         price,
-                        "source":       "dnjournal",
-                    })
-            time.sleep(1)
-        except Exception as e:
-            log.warning(f"DNJournal error ({url}): {e}")
-
-    log.info(f"DNJournal → {len(sales)} ventes collectées (> {MIN_SALE}€)")
-    return sales
-
-
-def fetch_namebio_top_sales() -> list[dict]:
-    """
-    Complément : top ventes récentes Namebio toutes catégories.
+    Scrape Namebio pour un mot-clé donné.
+    Retourne les ventes avec domaine + prix.
     """
     sales = []
     try:
-        r    = requests.get(
-            "https://namebio.com/?s=&sales=1&datefilter=90",
+        r = requests.get(
+            f"https://namebio.com/?s={keyword}",
             headers=HEADERS, timeout=15
         )
         soup = BeautifulSoup(r.text, "html.parser")
-        for row in soup.select("table.table tbody tr")[:100]:
+
+        # Structure Namebio : table avec colonnes Domain, Price, Date, ...
+        for row in soup.select("table tbody tr"):
             cols = row.find_all("td")
-            if len(cols) < 3:
+            if len(cols) < 2:
                 continue
-            domain_raw = cols[0].get_text(strip=True).lower()
-            price      = parse_price(cols[1].get_text(strip=True))
+
+            domain_raw = cols[0].get_text(strip=True).lower().strip()
+            price_raw  = cols[1].get_text(strip=True)
+            price      = parse_price(price_raw)
+
             if price < MIN_SALE:
                 continue
+
+            # Valide que c'est bien un domaine
             domain_clean = re.sub(r"[^a-z0-9.\-]", "", domain_raw)
-            if "." not in domain_clean:
+            if "." not in domain_clean or len(domain_clean) < 4 or len(domain_clean) > 50:
                 continue
+
+            # Exclut les domaines trop longs ou absurdes
+            name_part = domain_clean.rsplit(".", 1)[0]
+            if len(name_part) > 20 or len(name_part) < 2:
+                continue
+
             sales.append({
                 "domaine_full": domain_clean,
                 "prix":         price,
                 "source":       "namebio",
             })
-    except Exception as e:
-        log.warning(f"Namebio top sales error: {e}")
 
-    log.info(f"Namebio → {len(sales)} ventes collectées (> {MIN_SALE}€)")
+    except Exception as e:
+        log.warning(f"Namebio error ({keyword}): {e}")
+
     return sales
 
-# ─── Extraction du pattern d'un domaine vendu ─────────────────────────────────
 
-def extract_pattern(domain_full: str) -> dict:
+def fetch_all_reference_sales() -> list[dict]:
     """
-    Extrait le nom, l'extension, la longueur et les mots-clés d'un domaine.
-    ex: "cashflow.io" → {name: "cashflow", ext: ".io", length: 8, words: ["cashflow"]}
+    Lance plusieurs recherches Namebio avec des seeds génériques
+    pour collecter un maximum de ventes de référence tous secteurs.
     """
+    all_sales = []
+    seen      = set()
+
+    # On prend 12 seeds aléatoires parmi les 25 pour varier les runs
+    seeds = random.sample(SEED_KEYWORDS, min(12, len(SEED_KEYWORDS)))
+
+    for seed in seeds:
+        log.info(f"Namebio seed : {seed}")
+        sales = fetch_namebio_sales_for_keyword(seed)
+        for s in sales:
+            if s["domaine_full"] not in seen:
+                seen.add(s["domaine_full"])
+                all_sales.append(s)
+        time.sleep(1.5)
+
+    log.info(f"Total ventes de référence : {len(all_sales)} (> {MIN_SALE}€)")
+    return all_sales
+
+# ─── Extraction pattern + génération variantes ────────────────────────────────
+
+def extract_pattern(domain_full: str) -> dict | None:
     parts = domain_full.rsplit(".", 1)
     if len(parts) != 2:
-        return {}
+        return None
     name = parts[0]
     ext  = "." + parts[1]
-    # Découpe les mots (camelCase ou séparateur)
-    words = re.findall(r"[a-z]+", name.lower())
-    return {
-        "name":   name,
-        "ext":    ext,
-        "length": len(name),
-        "words":  words,
-    }
+    if len(name) < 2 or len(name) > 20:
+        return None
+    return {"name": name, "ext": ext, "length": len(name)}
 
-# ─── Génération de variantes disponibles ──────────────────────────────────────
 
 def generate_variants(pattern: dict, sold_price: float) -> list[dict]:
-    """
-    À partir d'un domaine vendu cher, génère des variantes proches
-    potentiellement disponibles à prix bas.
-    """
     if not pattern:
         return []
 
-    name  = pattern["name"]
-    words = pattern["words"]
-    variants = []
+    name     = pattern["name"]
+    variants = set()
 
-    # Variantes d'extension
+    # 1. Autres extensions
     for ext in [".com", ".io", ".fr", ".co", ".ai"]:
         if ext != pattern["ext"]:
-            variants.append((name, ext))
+            variants.add((name, ext))
 
-    # Variantes de nom
-    prefixes = ["get", "my", "use", "go", "the", "pro", "try", ""]
-    suffixes = ["hq", "app", "hub", "pro", "now", "ly", "io", ""]
+    # 2. Préfixes légers
+    for pre in ["get", "my", "use", "go", ""]:
+        for ext in [".com", ".io"]:
+            new = f"{pre}{name}".strip()
+            if new != name and 3 <= len(new) <= 20:
+                variants.add((new, ext))
 
-    for pre in prefixes[:3]:
-        for suf in suffixes[:3]:
-            for ext in [".com", ".io", ".fr"]:
-                new_name = f"{pre}{name}{suf}".strip()
-                if new_name != name and 3 <= len(new_name) <= 20:
-                    variants.append((new_name, ext))
+    # 3. Suffixes légers
+    for suf in ["hq", "app", "hub", "pro", ""]:
+        for ext in [".com", ".io"]:
+            new = f"{name}{suf}".strip()
+            if new != name and 3 <= len(new) <= 20:
+                variants.add((new, ext))
 
-    # Variantes pluriel / singulier
-    if name.endswith("s"):
-        variants.append((name[:-1], pattern["ext"]))
-        variants.append((name[:-1], ".com"))
+    # 4. Pluriel / singulier
+    if name.endswith("s") and len(name) > 3:
+        variants.add((name[:-1], ".com"))
+        variants.add((name[:-1], pattern["ext"]))
     else:
-        variants.append((name + "s", pattern["ext"]))
-        variants.append((name + "s", ".com"))
+        variants.add((name + "s", ".com"))
 
-    # Déduplique et limite
-    seen = set()
     result = []
-    for v in variants:
-        key = v[0] + v[1]
-        if key not in seen and key != pattern["name"] + pattern["ext"]:
-            seen.add(key)
-            result.append({
-                "domaine":           v[0],
-                "extension":         v[1],
-                "prix_achat_estime": 12,
-                "domaine_source":    pattern["name"] + pattern["ext"],
-                "prix_source":       sold_price,
-            })
-    return result[:MAX_VARIANTS]
+    for v_name, v_ext in list(variants)[:MAX_VARIANTS]:
+        result.append({
+            "domaine":           v_name,
+            "extension":         v_ext,
+            "prix_achat_estime": 12,
+            "domaine_source":    pattern["name"] + pattern["ext"],
+            "prix_source":       sold_price,
+        })
+    return result
 
-# ─── Vérification disponibilité RDAP ──────────────────────────────────────────
+# ─── Disponibilité RDAP ───────────────────────────────────────────────────────
 
 def check_available(domain_full: str) -> bool:
-    """Retourne True si le domaine est disponible (404 = non enregistré)."""
     try:
         r = requests.get(
             f"https://rdap.org/domain/{domain_full}",
@@ -251,10 +233,9 @@ def check_available(domain_full: str) -> bool:
     except Exception:
         return False
 
-# ─── Ventes similaires sur Namebio ────────────────────────────────────────────
+# ─── Ventes similaires Namebio ────────────────────────────────────────────────
 
-def fetch_similar_sales(keyword: str) -> list[float]:
-    """Retourne la liste des prix de ventes similaires pour un mot-clé."""
+def fetch_similar_prices(keyword: str) -> list[float]:
     prices = []
     try:
         r    = requests.get(
@@ -262,7 +243,7 @@ def fetch_similar_sales(keyword: str) -> list[float]:
             headers=HEADERS, timeout=15
         )
         soup = BeautifulSoup(r.text, "html.parser")
-        for row in soup.select("table.table tbody tr")[:20]:
+        for row in soup.select("table tbody tr")[:20]:
             cols  = row.find_all("td")
             if len(cols) < 2:
                 continue
@@ -273,14 +254,14 @@ def fetch_similar_sales(keyword: str) -> list[float]:
         log.warning(f"Namebio similar ({keyword}): {e}")
     return prices
 
-# ─── Google Trends — appel HTTP direct ────────────────────────────────────────
+# ─── Google Trends — HTTP direct ──────────────────────────────────────────────
 
 def get_trend_score(keyword: str) -> int:
     kw = keyword.replace("-", " ")
     try:
         session = requests.Session()
         session.headers.update(HEADERS)
-        r1 = session.get(
+        session.get(
             "https://trends.google.com/trends/explore",
             params={"q": kw, "date": "today 3-m", "geo": "", "hl": "fr"},
             timeout=15
@@ -298,6 +279,8 @@ def get_trend_score(keyword: str) -> int:
             timeout=15
         )
         raw   = r2.text.lstrip(")]}'").strip()
+        if not raw:
+            return 0
         data  = json.loads(raw)
         token = data["widgets"][0]["token"]
         req   = data["widgets"][0]["request"]
@@ -310,6 +293,8 @@ def get_trend_score(keyword: str) -> int:
             timeout=15
         )
         raw3   = r3.text.lstrip(")]}'").strip()
+        if not raw3:
+            return 0
         data3  = json.loads(raw3)
         values = [
             pt["value"][0]
@@ -350,69 +335,58 @@ def get_backlinks_score(domain_full: str) -> tuple[int, int]:
 def parse_price(raw: str) -> float:
     raw = re.sub(r"[^\d.]", "", raw.replace(",", ""))
     try:
-        return float(raw)
+        v = float(raw)
+        return v if v < 10_000_000 else 0.0   # filtre valeurs aberrantes
     except Exception:
         return 0.0
 
 # ─── Scoring ──────────────────────────────────────────────────────────────────
 
 def score_domain(domain: dict, similar_prices: list[float], trend: int) -> dict:
-    """
-    Scoring orienté inefficience de marché :
-      ratio valeur/prix  40%
-      liquidité          25%
-      tendance           20%
-      SEO                15%
-    """
-    name = domain["domaine"].lower()
-    ext  = domain["extension"]
+    name         = domain["domaine"].lower()
+    ext          = domain["extension"]
+    prix_achat   = domain.get("prix_achat_estime", 12)
+    prix_source  = domain.get("prix_source", 0)
 
-    prix_achat    = domain.get("prix_achat_estime", 12)
-    prix_source   = domain.get("prix_source", 0)
-
-    # --- Valeur estimée ---
-    # Moyenne pondérée : prix source (domaine similaire vendu) + ventes Namebio
-    all_prices = similar_prices.copy()
+    # Valeur estimée
+    all_prices = [p for p in similar_prices if 0 < p < 500_000]
     if prix_source > 0:
         all_prices.append(prix_source)
 
     valeur_estimee = 0
     if all_prices:
-        # Retire les outliers extrêmes (> 10x la médiane)
-        sorted_p = sorted(all_prices)
-        median   = sorted_p[len(sorted_p) // 2]
-        filtered = [p for p in all_prices if p <= median * 10]
+        sorted_p       = sorted(all_prices)
+        median         = sorted_p[len(sorted_p) // 2]
+        filtered       = [p for p in all_prices if p <= median * 8]
         valeur_estimee = int(sum(filtered) / len(filtered)) if filtered else 0
 
-    # --- Score ratio (40%) ---
+    # Score ratio (40%)
     ratio = valeur_estimee / max(prix_achat, 1)
-    if ratio >= 100:   s_ratio = 100
-    elif ratio >= 50:  s_ratio = 90
-    elif ratio >= 20:  s_ratio = 75
-    elif ratio >= 10:  s_ratio = 60
-    elif ratio >= 5:   s_ratio = 40
-    elif ratio >= 2:   s_ratio = 20
-    else:              s_ratio = 5
+    if ratio >= 100:    s_ratio = 100
+    elif ratio >= 50:   s_ratio = 90
+    elif ratio >= 20:   s_ratio = 75
+    elif ratio >= 10:   s_ratio = 60
+    elif ratio >= 5:    s_ratio = 40
+    elif ratio >= 2:    s_ratio = 20
+    else:               s_ratio = 5
 
-    # --- Score liquidité (25%) ---
-    # Mesure si ce type de domaine se vend régulièrement
-    nb_ventes   = len(similar_prices)
-    if nb_ventes >= 20:  s_liquidite = 100
-    elif nb_ventes >= 10: s_liquidite = 80
-    elif nb_ventes >= 5:  s_liquidite = 60
-    elif nb_ventes >= 2:  s_liquidite = 40
-    elif nb_ventes >= 1:  s_liquidite = 20
-    else:                 s_liquidite = 0
+    # Score liquidité (25%)
+    nb = len(similar_prices)
+    if nb >= 20:    s_liquidite = 100
+    elif nb >= 10:  s_liquidite = 80
+    elif nb >= 5:   s_liquidite = 60
+    elif nb >= 2:   s_liquidite = 40
+    elif nb >= 1:   s_liquidite = 20
+    else:           s_liquidite = 0
 
-    # --- Score tendance (20%) ---
+    # Score tendance (20%)
     s_tendance = int(trend) if trend else 0
 
-    # --- Score SEO (15%) ---
+    # Score SEO (15%)
     s_seo, nb_backlinks = get_backlinks_score(name + ext)
     s_seo        = int(s_seo) if s_seo else 0
     nb_backlinks = int(nb_backlinks) if nb_backlinks else 0
 
-    # --- Agrégation ---
     score_global = int(
         s_ratio     * 0.40 +
         s_liquidite * 0.25 +
@@ -420,20 +394,20 @@ def score_domain(domain: dict, similar_prices: list[float], trend: int) -> dict:
         s_seo       * 0.15
     )
 
-    # --- Rationale ---
+    # Rationale
     parts = []
-    if valeur_estimee > 0:
-        parts.append(f"valeur estimée ~{valeur_estimee}€ pour {prix_achat}€ d'achat (x{int(ratio)})")
-    if nb_ventes > 0:
-        avg_similar = int(sum(similar_prices) / len(similar_prices)) if similar_prices else 0
-        parts.append(f"{nb_ventes} ventes similaires (moy. {avg_similar}€)")
-    if trend >= 50:
-        parts.append(f"tendance Google {trend}/100")
+    if valeur_estimee > 0 and ratio >= 2:
+        parts.append(f"valeur ~{valeur_estimee}€ pour {prix_achat}€ (x{int(ratio)})")
+    if nb > 0:
+        avg_s = int(sum(similar_prices) / len(similar_prices)) if similar_prices else 0
+        parts.append(f"{nb} ventes similaires (moy. {avg_s}€)")
+    if trend >= 40:
+        parts.append(f"tendance {trend}/100")
     if nb_backlinks > 0:
-        parts.append(f"{nb_backlinks} backlinks hérités")
+        parts.append(f"{nb_backlinks} backlinks")
     if domain.get("domaine_source"):
-        parts.append(f"inspiré de {domain['domaine_source']} vendu {int(prix_source)}€")
-    rationale = " · ".join(parts) if parts else "Domaine disponible — données insuffisantes"
+        parts.append(f"variante de {domain['domaine_source']} vendu {int(prix_source)}€")
+    rationale = " · ".join(parts) if parts else "Domaine disponible — données de marché limitées"
 
     return {
         **domain,
@@ -444,12 +418,12 @@ def score_domain(domain: dict, similar_prices: list[float], trend: int) -> dict:
         "score_seo":            s_seo,
         "valeur_estimee":       valeur_estimee,
         "ratio_valeur_prix":    round(ratio, 1),
-        "nb_ventes_similaires": nb_ventes,
+        "nb_ventes_similaires": nb,
         "prix_moyen_ventes":    int(sum(similar_prices) / len(similar_prices)) if similar_prices else 0,
         "tendance_score":       trend,
         "backlinks":            nb_backlinks,
         "rationale":            rationale,
-        "lien_achat":           (
+        "lien_achat": (
             f"https://www.godaddy.com/domainsearch/find"
             f"?checkAvail=1&domainToCheck={name}{ext}"
         ),
@@ -469,7 +443,7 @@ def send_alert(opportunities: list[dict]):
           <td style="padding:8px;border-bottom:1px solid #eee">
             <strong>{o['domaine']}{o['extension']}</strong><br>
             <span style="font-size:11px;color:#999">
-              inspiré de {o.get('domaine_source','—')}
+              variante de {o.get('domaine_source','—')}
               vendu {int(o.get('prix_source',0))}€
             </span>
           </td>
@@ -479,7 +453,7 @@ def send_alert(opportunities: list[dict]):
               {o['score_global']}/100
             </span>
           </td>
-          <td style="padding:8px;border-bottom:1px solid #eee;text-align:center">
+          <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;font-weight:bold">
             x{o.get('ratio_valeur_prix','—')}
           </td>
           <td style="padding:8px;border-bottom:1px solid #eee;text-align:center">
@@ -495,23 +469,19 @@ def send_alert(opportunities: list[dict]):
 
     html = f"""
     <html><body style="font-family:Arial,sans-serif;max-width:800px;margin:auto">
-      <h2 style="color:#1a1a1a">Opportunités domaines sous-évalués</h2>
-      <p style="color:#666">Scan du {datetime.now().strftime('%d/%m/%Y à %Hh%M')}
-         — score > {SCORE_ALERT}</p>
+      <h2 style="color:#1a1a1a">Domaines sous-évalués — opportunités</h2>
+      <p style="color:#666">Scan du {datetime.now().strftime('%d/%m/%Y à %Hh%M')}</p>
       <table style="width:100%;border-collapse:collapse">
         <thead><tr style="background:#f5f5f5">
           <th style="padding:8px;text-align:left">Domaine</th>
           <th style="padding:8px">Score</th>
           <th style="padding:8px">Ratio</th>
-          <th style="padding:8px">Prix achat → valeur</th>
+          <th style="padding:8px">Achat → Valeur</th>
           <th style="padding:8px;text-align:left">Rationale</th>
           <th style="padding:8px">Lien</th>
         </tr></thead>
         <tbody>{rows}</tbody>
       </table>
-      <p style="color:#999;font-size:12px;margin-top:20px">
-        Domain Agent v4 · Scan automatique
-      </p>
     </body></html>"""
 
     msg            = MIMEMultipart("alternative")
@@ -533,37 +503,35 @@ def send_alert(opportunities: list[dict]):
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
-    log.info("=== Démarrage scan domain agent v4 ===")
+    log.info("=== Démarrage scan domain agent v5 ===")
     sh = get_sheet()
     ensure_sheets(sh)
     ws_opp = sh.worksheet("opportunites")
     ws_ref = sh.worksheet("ventes_reference")
 
-    # ── Étape 1 : collecter les ventes de référence ──────────────────────────
-    log.info("Collecte des ventes de référence (DNJournal + Namebio)...")
-    ref_sales = fetch_dnjournal_sales()
-
-    # Complément Namebio si DNJournal insuffisant
-    if len(ref_sales) < 20:
-        ref_sales += fetch_namebio_top_sales()
+    # Étape 1 : collecter les ventes de référence
+    log.info("Collecte des ventes de référence...")
+    ref_sales = fetch_all_reference_sales()
 
     if not ref_sales:
-        log.error("Aucune vente de référence collectée — arrêt")
+        log.error("Aucune vente de référence — arrêt")
         return
 
-    # Sauvegarde des ventes de référence dans le Sheet
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    ref_rows = [[now, s["domaine_full"], s["prix"], s["source"], ""] for s in ref_sales]
-    ws_ref.append_rows(ref_rows[:100], value_input_option="RAW")
+    # Sauvegarde dans Sheet
+    now      = datetime.now().strftime("%Y-%m-%d %H:%M")
+    ref_rows = [[now, s["domaine_full"], s["prix"], s["source"]] for s in ref_sales]
+    ws_ref.append_rows(ref_rows[:150], value_input_option="RAW")
     log.info(f"{len(ref_sales)} ventes de référence sauvegardées")
 
-    # ── Étape 2 : générer et filtrer les variantes ────────────────────────────
+    # Étape 2 : générer variantes
     log.info("Génération des variantes...")
     candidates: list[dict] = []
     seen: set[str]         = set()
 
-    for sale in ref_sales[:80]:   # top 80 ventes comme sources
+    for sale in ref_sales[:60]:
         pattern  = extract_pattern(sale["domaine_full"])
+        if not pattern:
+            continue
         variants = generate_variants(pattern, sale["prix"])
         for v in variants:
             key = v["domaine"] + v["extension"]
@@ -571,65 +539,49 @@ def run():
                 seen.add(key)
                 candidates.append(v)
 
-    log.info(f"{len(candidates)} variantes générées — vérification disponibilité...")
+    log.info(f"{len(candidates)} variantes générées")
 
-    # ── Étape 3 : vérifier disponibilité + scorer ─────────────────────────────
+    # Étape 3 : vérifier disponibilité + scorer
     all_scored: list[dict] = []
+    random.shuffle(candidates)   # évite les biais de seed
 
-    for i, candidate in enumerate(candidates):
+    for candidate in candidates:
+        if len(all_scored) >= 50:
+            break
+
         domain_full = candidate["domaine"] + candidate["extension"]
 
-        # Vérification RDAP
         if not check_available(domain_full):
             continue
 
-        log.info(f"Disponible : {domain_full} (source: {candidate['domaine_source']} → {candidate['prix_source']}€)")
+        log.info(f"Disponible : {domain_full} "
+                 f"(source: {candidate['domaine_source']} → {int(candidate['prix_source'])}€)")
 
-        # Ventes similaires Namebio
-        keyword        = candidate["domaine"][:8]   # mot-clé court pour la recherche
-        similar_prices = fetch_similar_sales(keyword)
+        keyword        = candidate["domaine"][:10]
+        similar_prices = fetch_similar_prices(keyword)
 
-        # Tendance Google
         time.sleep(random.randint(2, 4))
         trend = get_trend_score(keyword)
-        log.info(f"Trend ({keyword}): {trend}")
 
         scored = score_domain(candidate, similar_prices, trend)
         all_scored.append(scored)
-
-        # Pause pour ne pas surcharger les APIs
         time.sleep(1)
 
-        # Limite à 60 domaines scorés par run pour rester dans les limites GitHub Actions
-        if len(all_scored) >= 60:
-            break
-
-    # ── Étape 4 : écriture Google Sheets ─────────────────────────────────────
+    # Étape 4 : écriture Sheet
     all_scored.sort(key=lambda x: x["score_global"], reverse=True)
     log.info(f"Total domaines scorés : {len(all_scored)}")
 
     rows_to_write = []
     for o in all_scored[:50]:
         rows_to_write.append([
-            now,
-            o["domaine"],
-            o["extension"],
-            o["prix_achat_estime"],
-            o["score_global"],
-            o["score_ratio"],
-            o["score_liquidite"],
-            o["score_tendance"],
-            o["score_seo"],
-            o["valeur_estimee"],
-            o["ratio_valeur_prix"],
-            o["nb_ventes_similaires"],
-            o["prix_moyen_ventes"],
-            o["tendance_score"],
-            o["backlinks"],
-            o.get("domaine_source", ""),
-            o.get("prix_source", 0),
-            o["rationale"],
-            o["lien_achat"],
+            now, o["domaine"], o["extension"], o["prix_achat_estime"],
+            o["score_global"], o["score_ratio"], o["score_liquidite"],
+            o["score_tendance"], o["score_seo"],
+            o["valeur_estimee"], o["ratio_valeur_prix"],
+            o["nb_ventes_similaires"], o["prix_moyen_ventes"],
+            o["tendance_score"], o["backlinks"],
+            o.get("domaine_source", ""), o.get("prix_source", 0),
+            o["rationale"], o["lien_achat"],
         ])
 
     if rows_to_write:
@@ -638,15 +590,15 @@ def run():
     else:
         log.warning("Aucune opportunité trouvée ce scan")
 
-    # ── Étape 5 : alertes email ───────────────────────────────────────────────
+    # Étape 5 : alertes email
     top_alerts = [o for o in all_scored if o["score_global"] >= SCORE_ALERT]
     if top_alerts:
-        log.info(f"{len(top_alerts)} domaine(s) déclenchent une alerte")
         send_alert(top_alerts)
+        log.info(f"{len(top_alerts)} alertes envoyées")
     else:
         log.info("Aucun domaine ne dépasse le seuil d'alerte")
 
-    log.info("=== Scan terminé v4 ===")
+    log.info("=== Scan terminé v5 ===")
 
 if __name__ == "__main__":
     run()
