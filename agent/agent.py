@@ -1,12 +1,9 @@
 """
-Domain Opportunity Agent — v6
-Sources : DomainsDB.info (API gratuite, domaines récents par mot-clé)
-          EstiBot (estimation valeur domaine, gratuit 1000 req/jour)
-          RDAP (disponibilité)
-          Google Trends (HTTP direct)
-          OpenPageRank (backlinks)
+Domain Opportunity Agent — v7
+Rapide : tourne en < 10 minutes
+Sources : DomainsDB.info (API gratuite) + RDAP (disponibilité, timeout 3s)
+Valeur  : heuristique (longueur + extension + demande mot-clé)
 Scoring : ratio valeur/prix 40% · liquidité 25% · tendance 20% · SEO 15%
-Zéro scraping — fonctionne depuis n'importe quelle IP
 """
 
 import os
@@ -28,8 +25,9 @@ log = logging.getLogger(__name__)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-BUDGET_MAX  = 200
-SCORE_ALERT = 70
+SCORE_ALERT    = 65
+MAX_RDAP       = 30    # nb max de vérifications RDAP par run — évite les timeouts
+MAX_SCORED     = 40    # nb max de domaines scorés par run
 
 SHEET_NAME  = os.getenv("GOOGLE_SHEET_NAME", "Domain Agent")
 GMAIL_FROM  = os.getenv("GMAIL_FROM")
@@ -46,23 +44,18 @@ HEADERS = {
     )
 }
 
-# Mots-clés seeds — tous secteurs, couvrent les domaines à forte demande
+# Seeds tous secteurs — 6 sélectionnés aléatoirement par run
 SEED_KEYWORDS = [
-    # Tech & Digital
-    "ai", "cloud", "data", "tech", "digital", "cyber", "crypto",
-    "saas", "api", "dev", "code", "software",
-    # Business & Finance
-    "pay", "trade", "market", "invest", "fund", "capital",
-    "finance", "cash", "bank", "wealth",
-    # Consumer & Brand
-    "shop", "store", "hub", "pro", "app", "go", "get",
-    "smart", "fast", "easy", "live", "now",
-    # Health & Legal
-    "health", "care", "legal", "law", "med",
+    "ai", "pay", "trade", "cloud", "data", "tech",
+    "health", "legal", "shop", "fund", "hub", "pro",
+    "market", "smart", "fast", "care", "lab", "go",
+    "invest", "saas", "crypto", "digital", "code", "app",
 ]
 
-# Extensions ciblées par ordre de valeur marché
 TARGET_EXTENSIONS = [".com", ".io", ".ai", ".co", ".fr"]
+
+# Valeur de base par extension (€) — basé sur moyennes marché
+EXT_BASE = {".com": 600, ".io": 350, ".ai": 500, ".co": 200, ".fr": 150}
 
 # ─── Google Sheets ─────────────────────────────────────────────────────────────
 
@@ -80,19 +73,16 @@ def ensure_sheets(sh):
     existing = [w.title for w in sh.worksheets()]
     for name, headers in [
         ("opportunites", [
-            "date_scan", "domaine", "extension", "prix_achat_estime",
+            "date_scan", "domaine", "extension", "prix_achat",
+            "valeur_estimee", "ratio_x",
             "score_global", "score_ratio", "score_liquidite",
             "score_tendance", "score_seo",
-            "valeur_estimee", "ratio_valeur_prix",
-            "popularite_mot_cle", "tendance_score", "backlinks",
-            "rationale", "lien_achat"
+            "demande_mot_cle", "tendance", "backlinks",
+            "mot_cle_source", "rationale", "lien_achat"
         ]),
         ("portefeuille", [
-            "date_achat", "domaine", "prix_achat", "plateforme_vente",
+            "date_achat", "domaine", "prix_achat", "plateforme",
             "prix_demande", "statut", "date_vente", "prix_vente", "pnl"
-        ]),
-        ("historique_scores", [
-            "date", "domaine", "score_global", "vendu", "prix_reel"
         ]),
     ]:
         if name not in existing:
@@ -100,161 +90,112 @@ def ensure_sheets(sh):
             ws.append_row(headers)
             log.info(f"Feuille créée : {name}")
 
-# ─── Source 1 : DomainsDB — domaines enregistrés récemment ───────────────────
-# API publique gratuite, sans clé : https://domainsdb.info
+# ─── DomainsDB — signal de demande ────────────────────────────────────────────
 
-def fetch_domains_by_keyword(keyword: str) -> list[dict]:
-    """
-    Retourne les domaines récemment enregistrés contenant ce mot-clé.
-    Signal : si beaucoup de gens enregistrent des domaines avec ce mot,
-    la demande est active → les variantes disponibles ont de la valeur.
-    """
+def fetch_domainsdb(keyword: str) -> list[dict]:
+    """Retourne les domaines récemment enregistrés contenant ce mot-clé."""
     results = []
-    for zone in ["com", "io", "ai", "co", "fr"]:
+    for zone in ["com", "io", "ai"]:
         try:
             r = requests.get(
                 "https://api.domainsdb.info/v1/domains/search",
-                params={
-                    "domain": keyword,
-                    "zone":   zone,
-                    "limit":  20,
-                    "page":   0,
-                },
-                headers=HEADERS,
-                timeout=15,
+                params={"domain": keyword, "zone": zone, "limit": 25, "page": 0},
+                headers=HEADERS, timeout=10,
             )
             if r.status_code != 200:
                 continue
-            data = r.json()
-            for item in data.get("domains", []):
-                name_full = item.get("domain", "")
-                if not name_full:
+            for item in r.json().get("domains", []):
+                name_full = item.get("domain", "").lower()
+                if "." not in name_full:
                     continue
-                # Filtre : le mot-clé doit être dans le nom (pas juste dans le TLD)
-                name_part = name_full.rsplit(".", 1)[0] if "." in name_full else name_full
-                if keyword.lower() not in name_part.lower():
+                name_part = name_full.rsplit(".", 1)[0]
+                if keyword.lower() not in name_part:
                     continue
-                if len(name_part) < 2 or len(name_part) > 20:
+                if not (2 <= len(name_part) <= 20):
                     continue
                 results.append({
                     "domain_full": name_full,
-                    "name":        name_part,
-                    "ext":         "." + zone,
-                    "keyword":     keyword,
+                    "name": name_part,
+                    "ext": "." + zone,
                 })
-            time.sleep(0.3)
+            time.sleep(0.5)
         except Exception as e:
-            log.warning(f"DomainsDB error ({keyword}/{zone}): {e}")
-
+            log.warning(f"DomainsDB ({keyword}/{zone}): {e}")
+    log.info(f"DomainsDB ({keyword}): {len(results)} domaines enregistrés")
     return results
 
-
-def get_keyword_demand(keyword: str, all_domains: list[dict]) -> int:
-    """
-    Mesure la popularité d'un mot-clé en comptant combien de domaines
-    enregistrés le contiennent. Plus il y en a, plus la demande est forte.
-    Score 0-100.
-    """
-    count = sum(1 for d in all_domains if keyword.lower() in d["name"].lower())
-    if count >= 50:   return 100
-    elif count >= 30: return 85
-    elif count >= 20: return 70
-    elif count >= 10: return 55
-    elif count >= 5:  return 40
-    elif count >= 2:  return 25
+def demand_score(keyword: str, registered: list[dict]) -> int:
+    """Score de demande 0-100 basé sur le nombre de domaines enregistrés."""
+    n = len(registered)
+    if n >= 60: return 100
+    if n >= 40: return 85
+    if n >= 25: return 70
+    if n >= 15: return 55
+    if n >= 8:  return 40
+    if n >= 3:  return 25
     return 10
 
-# ─── Source 2 : EstiBot — estimation valeur domaine ──────────────────────────
-# Gratuit, 1000 req/jour : https://www.estibot.com
+# ─── RDAP — disponibilité (timeout court) ─────────────────────────────────────
 
-def get_estibot_value(domain_full: str) -> int:
+def is_available(domain_full: str) -> bool:
     """
-    Retourne la valeur estimée du domaine en USD (converti en €).
-    EstiBot utilise un modèle ML basé sur les ventes historiques.
+    Vérifie si un domaine est disponible via RDAP.
+    Timeout 3s — si ça ne répond pas vite, on considère pris.
     """
-    try:
-        r = requests.get(
-            f"https://www.estibot.com/appraise.php",
-            params={"a": domain_full},
-            headers=HEADERS,
-            timeout=15,
-        )
-        # EstiBot retourne du JSON ou du texte selon l'endpoint
-        # On parse la valeur depuis la réponse
-        text = r.text
-        # Cherche un pattern de valeur numérique
-        match = re.search(r'"appraisal"\s*:\s*"?\$?([\d,]+)"?', text)
-        if match:
-            val = float(match.group(1).replace(",", ""))
-            return int(val * 0.92)   # USD → EUR approximatif
-        # Fallback : cherche tout nombre précédé de $
-        match2 = re.search(r'\$\s*([\d,]+)', text)
-        if match2:
-            val = float(match2.group(1).replace(",", ""))
-            return int(val * 0.92)
-        return 0
-    except Exception as e:
-        log.warning(f"EstiBot error ({domain_full}): {e}")
-        return 0
-
-
-def estimate_value_heuristic(name: str, ext: str, keyword_demand: int) -> int:
-    """
-    Estimation heuristique de valeur si EstiBot échoue.
-    Basée sur : longueur, extension, demande du mot-clé.
-    """
-    # Base selon extension
-    ext_base = {".com": 500, ".io": 300, ".ai": 400, ".co": 200, ".fr": 150}
-    base = ext_base.get(ext, 100)
-
-    # Bonus longueur (plus court = plus cher)
-    length = len(name)
-    if length <= 4:     length_mult = 4.0
-    elif length <= 6:   length_mult = 2.5
-    elif length <= 8:   length_mult = 1.5
-    elif length <= 10:  length_mult = 1.0
-    else:               length_mult = 0.6
-
-    # Bonus demande mot-clé
-    demand_mult = 1 + (keyword_demand / 100)
-
-    return int(base * length_mult * demand_mult)
-
-# ─── Source 3 : RDAP — vérification disponibilité ────────────────────────────
-
-def check_available(domain_full: str) -> bool:
     try:
         r = requests.get(
             f"https://rdap.org/domain/{domain_full}",
-            timeout=8, headers=HEADERS
+            timeout=3, headers=HEADERS
         )
         return r.status_code == 404
     except Exception:
         return False
 
-# ─── Source 4 : Google Trends — HTTP direct ───────────────────────────────────
+# ─── Estimation de valeur heuristique ─────────────────────────────────────────
 
-def get_trend_score(keyword: str) -> int:
-    kw = keyword.replace("-", " ")
+def estimate_value(name: str, ext: str, kw_demand: int) -> int:
+    """
+    Estimation de valeur basée sur :
+    - Extension (base de marché)
+    - Longueur du nom (plus court = plus cher)
+    - Demande du mot-clé
+    """
+    base   = EXT_BASE.get(ext, 100)
+    length = len(name)
+
+    if length <= 3:    lmult = 8.0
+    elif length <= 5:  lmult = 4.0
+    elif length <= 7:  lmult = 2.0
+    elif length <= 9:  lmult = 1.2
+    elif length <= 12: lmult = 0.8
+    else:              lmult = 0.4
+
+    dmult = 1.0 + (kw_demand / 100) * 1.5   # demande booste la valeur jusqu'à x2.5
+
+    return max(50, int(base * lmult * dmult))
+
+# ─── Google Trends — HTTP direct ──────────────────────────────────────────────
+
+def get_trend(keyword: str) -> int:
     try:
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        session.get(
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        s.get(
             "https://trends.google.com/trends/explore",
-            params={"q": kw, "date": "today 3-m", "geo": "", "hl": "fr"},
-            timeout=15,
+            params={"q": keyword, "date": "today 3-m", "geo": "", "hl": "fr"},
+            timeout=10,
         )
         time.sleep(1)
-        r2 = session.get(
+        r2 = s.get(
             "https://trends.google.com/trends/api/explore",
             params={
                 "hl": "fr", "tz": -60,
                 "req": json.dumps({
-                    "comparisonItem": [{"keyword": kw, "geo": "", "time": "today 3-m"}],
-                    "category": 0, "property": ""
+                    "comparisonItem": [{"keyword": keyword, "geo": "", "time": "today 3-m"}],
+                    "category": 0, "property": "",
                 }),
             },
-            timeout=15,
+            timeout=10,
         )
         raw = r2.text.lstrip(")]}'").strip()
         if not raw:
@@ -262,35 +203,32 @@ def get_trend_score(keyword: str) -> int:
         data  = json.loads(raw)
         token = data["widgets"][0]["token"]
         req   = data["widgets"][0]["request"]
-
         time.sleep(1)
-        r3 = session.get(
+        r3 = s.get(
             "https://trends.google.com/trends/api/widgetdata/multiline",
-            params={"hl": "fr", "tz": -60,
-                    "req": json.dumps(req), "token": token},
-            timeout=15,
+            params={"hl": "fr", "tz": -60, "req": json.dumps(req), "token": token},
+            timeout=10,
         )
-        raw3 = r3.text.lstrip(")]}'").strip()
+        raw3   = r3.text.lstrip(")]}'").strip()
         if not raw3:
             return 0
-        data3  = json.loads(raw3)
-        values = [
+        vals = [
             pt["value"][0]
-            for pt in data3["default"]["timelineData"]
+            for pt in json.loads(raw3)["default"]["timelineData"]
             if pt.get("value")
         ]
-        if not values:
+        if not vals:
             return 0
-        avg   = sum(values) / len(values)
-        delta = sum(values[-4:]) / 4 - sum(values[:4]) / 4
+        avg   = sum(vals) / len(vals)
+        delta = sum(vals[-4:]) / 4 - sum(vals[:4]) / 4
         return min(100, int(avg + max(0, delta * 2)))
     except Exception as e:
-        log.warning(f"Trends error ({keyword}): {e}")
+        log.warning(f"Trends ({keyword}): {e}")
         return 0
 
-# ─── Source 5 : OpenPageRank ──────────────────────────────────────────────────
+# ─── OpenPageRank ──────────────────────────────────────────────────────────────
 
-def get_backlinks_score(domain_full: str) -> tuple[int, int]:
+def get_seo(domain_full: str) -> tuple[int, int]:
     if not OPR_API_KEY:
         return 0, 0
     try:
@@ -298,211 +236,119 @@ def get_backlinks_score(domain_full: str) -> tuple[int, int]:
             "https://openpagerank.com/api/v1.0/getPageRank",
             params={"domains[]": domain_full},
             headers={"API-OPR": OPR_API_KEY},
-            timeout=10,
+            timeout=8,
         )
-        data = r.json()
-        rank = int(data["response"][0].get("page_rank_integer") or 0)
-        bl   = int(data["response"][0].get("rank") or 0)
+        resp = r.json()["response"][0]
+        rank = int(resp.get("page_rank_integer") or 0)
+        bl   = int(resp.get("rank") or 0)
         return min(100, rank * 12), bl
-    except Exception as e:
-        log.warning(f"OPR error ({domain_full}): {e}")
+    except Exception:
         return 0, 0
-
-# ─── Génération de variantes ──────────────────────────────────────────────────
-
-def generate_available_variants(
-    keyword: str,
-    registered_domains: list[dict],
-    keyword_demand: int,
-) -> list[dict]:
-    """
-    Pour un mot-clé, génère des combinaisons de domaines
-    et retourne ceux qui sont disponibles à l'achat.
-    """
-    prefixes = ["get", "my", "use", "go", "the", "pro", "be", ""]
-    suffixes = ["hq", "app", "hub", "pro", "now", "ly", "ai", ""]
-
-    candidates = set()
-    for pre in prefixes[:4]:
-        for suf in suffixes[:4]:
-            for ext in TARGET_EXTENSIONS:
-                name = f"{pre}{keyword}{suf}".strip()
-                if 3 <= len(name) <= 18:
-                    candidates.add((name, ext))
-
-    # Ajoute des variantes depuis les domaines déjà enregistrés
-    for d in registered_domains[:10]:
-        name = d["name"]
-        # Extension alternative
-        for ext in TARGET_EXTENSIONS:
-            if ext != d["ext"]:
-                candidates.add((name, ext))
-        # Pluriel
-        if not name.endswith("s"):
-            candidates.add((name + "s", d["ext"]))
-            candidates.add((name + "s", ".com"))
-
-    available = []
-    for name, ext in list(candidates):
-        domain_full = name + ext
-        # Ne teste pas les domaines déjà enregistrés qu'on vient de collecter
-        already_registered = any(
-            d["domain_full"] == domain_full for d in registered_domains
-        )
-        if already_registered:
-            continue
-        if check_available(domain_full):
-            available.append({
-                "domaine":           name,
-                "extension":         ext,
-                "prix_achat_estime": 12,
-                "keyword_source":    keyword,
-                "keyword_demand":    keyword_demand,
-            })
-        time.sleep(0.3)
-
-    log.info(f"Variants disponibles ({keyword}): {len(available)}")
-    return available
 
 # ─── Scoring ──────────────────────────────────────────────────────────────────
 
-def score_domain(domain: dict, valeur: int, trend: int) -> dict:
-    name         = domain["domaine"].lower()
-    ext          = domain["extension"]
-    prix_achat   = domain.get("prix_achat_estime", 12)
-    kw_demand    = domain.get("keyword_demand", 0)
+def score(domain: str, ext: str, kw: str, kw_demand: int, trend: int) -> dict:
+    prix    = 12
+    valeur  = estimate_value(domain, ext, kw_demand)
+    ratio   = valeur / prix
 
-    # Valeur finale : EstiBot si dispo, sinon heuristique
-    if valeur <= 0:
-        valeur = estimate_value_heuristic(name, ext, kw_demand)
+    # Ratio valeur/prix (40%)
+    if ratio >= 100:   sr = 100
+    elif ratio >= 50:  sr = 90
+    elif ratio >= 20:  sr = 75
+    elif ratio >= 10:  sr = 60
+    elif ratio >= 5:   sr = 40
+    else:              sr = 20
 
-    # Score ratio valeur/prix (40%)
-    ratio = valeur / max(prix_achat, 1)
-    if ratio >= 100:   s_ratio = 100
-    elif ratio >= 50:  s_ratio = 90
-    elif ratio >= 20:  s_ratio = 75
-    elif ratio >= 10:  s_ratio = 60
-    elif ratio >= 5:   s_ratio = 40
-    elif ratio >= 2:   s_ratio = 20
-    else:              s_ratio = 5
+    # Liquidité = demande mot-clé (25%)
+    sl = kw_demand
 
-    # Score liquidité (25%) — basé sur la demande du mot-clé
-    s_liquidite = int(kw_demand) if kw_demand else 0
+    # Tendance (20%)
+    st = trend
 
-    # Score tendance (20%)
-    s_tendance = int(trend) if trend else 0
+    # SEO (15%)
+    seo_score, backlinks = get_seo(domain + ext)
 
-    # Score SEO (15%)
-    s_seo, nb_backlinks = get_backlinks_score(name + ext)
-    s_seo        = int(s_seo) if s_seo else 0
-    nb_backlinks = int(nb_backlinks) if nb_backlinks else 0
+    total = int(sr * 0.40 + sl * 0.25 + st * 0.20 + seo_score * 0.15)
 
-    score_global = int(
-        s_ratio     * 0.40 +
-        s_liquidite * 0.25 +
-        s_tendance  * 0.20 +
-        s_seo       * 0.15
-    )
-
-    # Rationale
-    parts = []
-    if valeur > 0:
-        parts.append(f"valeur estimée ~{valeur}€ pour {prix_achat}€ (x{int(ratio)})")
+    parts = [f"valeur ~{valeur}€ pour {prix}€ (x{int(ratio)})"]
     if kw_demand >= 50:
-        parts.append(f"mot-clé très demandé (popularité {kw_demand}/100)")
-    elif kw_demand >= 25:
-        parts.append(f"mot-clé en demande (popularité {kw_demand}/100)")
+        parts.append(f"mot-clé populaire ({kw_demand}/100)")
     if trend >= 40:
-        parts.append(f"tendance Google {trend}/100")
-    if nb_backlinks > 0:
-        parts.append(f"{nb_backlinks} backlinks hérités")
-    rationale = " · ".join(parts) if parts else "Domaine disponible — potentiel à confirmer"
+        parts.append(f"tendance {trend}/100")
+    if backlinks > 0:
+        parts.append(f"{backlinks} backlinks")
 
     return {
-        **domain,
-        "score_global":      score_global,
-        "score_ratio":       s_ratio,
-        "score_liquidite":   s_liquidite,
-        "score_tendance":    s_tendance,
-        "score_seo":         s_seo,
-        "valeur_estimee":    valeur,
-        "ratio_valeur_prix": round(ratio, 1),
-        "popularite_mot_cle": kw_demand,
-        "tendance_score":    trend,
-        "backlinks":         nb_backlinks,
-        "rationale":         rationale,
+        "domaine":         domain,
+        "extension":       ext,
+        "prix_achat":      prix,
+        "valeur_estimee":  valeur,
+        "ratio_x":         round(ratio, 1),
+        "score_global":    total,
+        "score_ratio":     sr,
+        "score_liquidite": sl,
+        "score_tendance":  st,
+        "score_seo":       seo_score,
+        "demande_mot_cle": kw_demand,
+        "tendance":        trend,
+        "backlinks":       backlinks,
+        "mot_cle_source":  kw,
+        "rationale":       " · ".join(parts),
         "lien_achat": (
             f"https://www.godaddy.com/domainsearch/find"
-            f"?checkAvail=1&domainToCheck={name}{ext}"
+            f"?checkAvail=1&domainToCheck={domain}{ext}"
         ),
     }
 
 # ─── Email ─────────────────────────────────────────────────────────────────────
 
-def send_alert(opportunities: list[dict]):
+def send_alert(opps: list[dict]):
     if not (GMAIL_FROM and GMAIL_TO and GMAIL_PASS):
-        log.warning("Gmail non configuré — alerte ignorée")
         return
-    top  = sorted(opportunities, key=lambda x: x["score_global"], reverse=True)[:5]
-    rows = ""
-    for o in top:
-        rows += f"""
+    top  = sorted(opps, key=lambda x: x["score_global"], reverse=True)[:5]
+    rows = "".join(f"""
         <tr>
           <td style="padding:8px;border-bottom:1px solid #eee">
-            <strong>{o['domaine']}{o['extension']}</strong><br>
-            <span style="font-size:11px;color:#999">
-              mot-clé : {o.get('keyword_source','—')}
-              · popularité {o.get('popularite_mot_cle',0)}/100
-            </span>
+            <strong>{o['domaine']}{o['extension']}</strong>
           </td>
           <td style="padding:8px;border-bottom:1px solid #eee;text-align:center">
-            <span style="background:#EAF3DE;color:#27500A;padding:3px 10px;
-                         border-radius:12px;font-weight:bold">
+            <span style="background:#EAF3DE;color:#27500A;padding:2px 8px;
+                         border-radius:10px;font-weight:bold">
               {o['score_global']}/100
             </span>
           </td>
           <td style="padding:8px;border-bottom:1px solid #eee;text-align:center;
-                     font-weight:bold;font-size:16px">
-            x{o.get('ratio_valeur_prix','—')}
-          </td>
+                     font-weight:bold">x{o['ratio_x']}</td>
           <td style="padding:8px;border-bottom:1px solid #eee;text-align:center">
-            ~{o['prix_achat_estime']}€ → ~{o['valeur_estimee']}€
+            12€ → ~{o['valeur_estimee']}€
           </td>
           <td style="padding:8px;border-bottom:1px solid #eee;font-size:12px;color:#666">
-            {o['rationale'][:120]}
+            {o['rationale'][:100]}
           </td>
           <td style="padding:8px;border-bottom:1px solid #eee">
             <a href="{o['lien_achat']}">Acheter →</a>
           </td>
-        </tr>"""
+        </tr>""" for o in top)
 
-    html = f"""
-    <html><body style="font-family:Arial,sans-serif;max-width:800px;margin:auto">
-      <h2 style="color:#1a1a1a">Domaines sous-évalués — opportunités</h2>
-      <p style="color:#666">Scan du {datetime.now().strftime('%d/%m/%Y à %Hh%M')}</p>
+    html = f"""<html><body style="font-family:Arial,sans-serif;max-width:750px;margin:auto">
+      <h2>Domaines sous-évalués — {datetime.now().strftime('%d/%m/%Y %Hh%M')}</h2>
       <table style="width:100%;border-collapse:collapse">
         <thead><tr style="background:#f5f5f5">
           <th style="padding:8px;text-align:left">Domaine</th>
-          <th style="padding:8px">Score</th>
-          <th style="padding:8px">Ratio</th>
-          <th style="padding:8px">Achat → Valeur</th>
+          <th style="padding:8px">Score</th><th style="padding:8px">Ratio</th>
+          <th style="padding:8px">Valeur</th>
           <th style="padding:8px;text-align:left">Rationale</th>
           <th style="padding:8px">Lien</th>
-        </tr></thead>
-        <tbody>{rows}</tbody>
+        </tr></thead><tbody>{rows}</tbody>
       </table>
-      <p style="color:#999;font-size:12px;margin-top:20px">
-        Domain Agent v6 · Scan automatique
-      </p>
+      <p style="color:#aaa;font-size:11px;margin-top:16px">Domain Agent v7</p>
     </body></html>"""
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = (
-        f"[Domain Agent] {len(top)} opportunité(s) sous-évaluée(s)"
-        f" — {datetime.now().strftime('%d/%m %Hh')}"
-    )
-    msg["From"] = GMAIL_FROM
-    msg["To"]   = GMAIL_TO
+    msg["Subject"] = f"[Domain Agent] {len(top)} opportunité(s) — {datetime.now().strftime('%d/%m %Hh')}"
+    msg["From"]    = GMAIL_FROM
+    msg["To"]      = GMAIL_TO
     msg.attach(MIMEText(html, "html"))
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
@@ -510,95 +356,108 @@ def send_alert(opportunities: list[dict]):
             s.send_message(msg)
         log.info(f"Email envoyé → {GMAIL_TO}")
     except Exception as e:
-        log.error(f"Erreur envoi email : {e}")
+        log.error(f"Email error: {e}")
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
-    log.info("=== Démarrage scan domain agent v6 ===")
+    log.info("=== Domain Agent v7 ===")
     sh = get_sheet()
     ensure_sheets(sh)
-    ws_opp = sh.worksheet("opportunites")
+    ws = sh.worksheet("opportunites")
 
-    # Sélection aléatoire de 8 seeds parmi les 40 — varie à chaque run
-    seeds = random.sample(SEED_KEYWORDS, min(8, len(SEED_KEYWORDS)))
-    log.info(f"Seeds sélectionnés : {seeds}")
+    seeds = random.sample(SEED_KEYWORDS, 6)
+    log.info(f"Seeds : {seeds}")
 
-    all_scored: list[dict] = []
-    seen_domains: set[str] = set()
+    candidates   = []   # (name, ext, kw, kw_demand)
+    seen         = set()
+    rdap_count   = 0
 
-    for keyword in seeds:
-        log.info(f"=== Traitement keyword : {keyword} ===")
+    # ── Étape 1 : collecter les signaux de demande ────────────────────────────
+    for kw in seeds:
+        registered = fetch_domainsdb(kw)
+        kw_demand  = demand_score(kw, registered)
+        log.info(f"Demande ({kw}): {kw_demand}/100")
 
-        # Étape 1 : domaines enregistrés récemment (signal de demande)
-        registered = fetch_domains_by_keyword(keyword)
-        log.info(f"DomainsDB ({keyword}) : {len(registered)} domaines enregistrés")
+        # Génère des variantes autour du mot-clé
+        prefixes = ["", "get", "my", "go", "pro"]
+        suffixes = ["", "hq", "app", "hub", "now"]
+        for pre in prefixes:
+            for suf in suffixes:
+                for ext in TARGET_EXTENSIONS:
+                    name = f"{pre}{kw}{suf}".strip()
+                    key  = name + ext
+                    if key not in seen and 3 <= len(name) <= 15:
+                        seen.add(key)
+                        candidates.append((name, ext, kw, kw_demand))
 
-        # Étape 2 : mesure de la demande
-        kw_demand = get_keyword_demand(keyword, registered)
-        log.info(f"Demande ({keyword}) : {kw_demand}/100")
+        time.sleep(0.5)
 
-        # Étape 3 : tendance Google
-        time.sleep(random.randint(2, 4))
-        trend = get_trend_score(keyword)
-        log.info(f"Tendance ({keyword}) : {trend}/100")
+    # Mélange pour éviter les biais de seed
+    random.shuffle(candidates)
+    log.info(f"{len(candidates)} variantes à vérifier (max {MAX_RDAP} RDAP)")
 
-        # Étape 4 : variantes disponibles
-        available = generate_available_variants(keyword, registered, kw_demand)
-
-        # Étape 5 : estimation valeur + scoring
-        for domain in available[:8]:   # max 8 par keyword
-            full = domain["domaine"] + domain["extension"]
-            if full in seen_domains:
-                continue
-            seen_domains.add(full)
-
-            # EstiBot — estimation valeur
-            valeur = get_estibot_value(full)
-            log.info(f"EstiBot ({full}) : {valeur}€")
-            time.sleep(0.5)
-
-            scored = score_domain(domain, valeur, trend)
-            all_scored.append(scored)
-
-            if len(all_scored) >= 60:
-                break
-
-        time.sleep(2)
-        if len(all_scored) >= 60:
+    # ── Étape 2 : vérifier disponibilité ─────────────────────────────────────
+    available = []
+    for name, ext, kw, kw_demand in candidates:
+        if rdap_count >= MAX_RDAP:
+            log.info(f"Limite RDAP atteinte ({MAX_RDAP})")
             break
+        domain_full = name + ext
+        rdap_count += 1
+        if is_available(domain_full):
+            log.info(f"Disponible : {domain_full}")
+            available.append((name, ext, kw, kw_demand))
+        time.sleep(0.3)
 
-    # Écriture Google Sheets
+    log.info(f"{len(available)} domaines disponibles")
+
+    # ── Étape 3 : tendances + scoring ─────────────────────────────────────────
+    all_scored = []
+    trend_cache: dict[str, int] = {}
+
+    for name, ext, kw, kw_demand in available[:MAX_SCORED]:
+        # Tendance (avec cache pour éviter les appels redondants)
+        if kw not in trend_cache:
+            time.sleep(random.randint(2, 4))
+            trend_cache[kw] = get_trend(kw)
+            log.info(f"Trend ({kw}): {trend_cache[kw]}/100")
+        trend = trend_cache[kw]
+
+        result = score(name, ext, kw, kw_demand, trend)
+        all_scored.append(result)
+
+    # ── Étape 4 : écriture Sheet ──────────────────────────────────────────────
     all_scored.sort(key=lambda x: x["score_global"], reverse=True)
-    log.info(f"Total domaines scorés : {len(all_scored)}")
+    log.info(f"Total scorés : {len(all_scored)}")
 
-    now           = datetime.now().strftime("%Y-%m-%d %H:%M")
-    rows_to_write = []
-    for o in all_scored[:50]:
-        rows_to_write.append([
-            now, o["domaine"], o["extension"], o["prix_achat_estime"],
+    now  = datetime.now().strftime("%Y-%m-%d %H:%M")
+    rows = []
+    for o in all_scored:
+        rows.append([
+            now, o["domaine"], o["extension"], o["prix_achat"],
+            o["valeur_estimee"], o["ratio_x"],
             o["score_global"], o["score_ratio"], o["score_liquidite"],
             o["score_tendance"], o["score_seo"],
-            o["valeur_estimee"], o["ratio_valeur_prix"],
-            o["popularite_mot_cle"], o["tendance_score"], o["backlinks"],
-            o["rationale"], o["lien_achat"],
+            o["demande_mot_cle"], o["tendance"], o["backlinks"],
+            o["mot_cle_source"], o["rationale"], o["lien_achat"],
         ])
 
-    if rows_to_write:
-        ws_opp.append_rows(rows_to_write, value_input_option="RAW")
-        log.info(f"{len(rows_to_write)} opportunités écrites dans Google Sheets")
+    if rows:
+        ws.append_rows(rows, value_input_option="RAW")
+        log.info(f"{len(rows)} lignes écrites dans Google Sheets")
     else:
-        log.warning("Aucune opportunité trouvée ce scan")
+        log.warning("Aucune opportunité trouvée")
 
-    # Alertes email
-    top_alerts = [o for o in all_scored if o["score_global"] >= SCORE_ALERT]
-    if top_alerts:
-        send_alert(top_alerts)
-        log.info(f"{len(top_alerts)} alertes envoyées")
+    # ── Étape 5 : alertes email ───────────────────────────────────────────────
+    alerts = [o for o in all_scored if o["score_global"] >= SCORE_ALERT]
+    if alerts:
+        send_alert(alerts)
+        log.info(f"{len(alerts)} alertes envoyées")
     else:
-        log.info("Aucun domaine ne dépasse le seuil d'alerte")
+        log.info("Aucune alerte — seuil non atteint")
 
-    log.info("=== Scan terminé v6 ===")
+    log.info("=== Scan terminé v7 ===")
 
 if __name__ == "__main__":
     run()
