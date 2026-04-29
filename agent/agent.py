@@ -1,7 +1,6 @@
 """
-Domain Opportunity Agent — Phase 1 (v2)
-Sources : WhoisXML API (domaines expirés), Namebio, Google Trends (avec retry), OpenPageRank
-Output  : Google Sheets + Gmail alert if score > 80
+Domain Opportunity Agent — Phase 1 (v3)
+Fixes : pytrends method_whitelist + NoneType backlinks
 """
 
 import os
@@ -16,7 +15,6 @@ from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from bs4 import BeautifulSoup
-from pytrends.request import TrendReq
 from google.oauth2.service_account import Credentials
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -37,13 +35,13 @@ EXTENSIONS  = [".com", ".io", ".fr", ".ai", ".co"]
 BUDGET_MAX  = 200
 SCORE_ALERT = 80
 
-SHEET_NAME      = os.getenv("GOOGLE_SHEET_NAME", "Domain Agent")
-GMAIL_FROM      = os.getenv("GMAIL_FROM")
-GMAIL_TO        = os.getenv("GMAIL_TO")
-GMAIL_PASS      = os.getenv("GMAIL_APP_PASSWORD")
-OPR_API_KEY     = os.getenv("OPR_API_KEY", "")
-GCP_CREDS       = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
-WHOISXML_KEY    = os.getenv("WHOISXML_API_KEY", "")
+SHEET_NAME   = os.getenv("GOOGLE_SHEET_NAME", "Domain Agent")
+GMAIL_FROM   = os.getenv("GMAIL_FROM")
+GMAIL_TO     = os.getenv("GMAIL_TO")
+GMAIL_PASS   = os.getenv("GMAIL_APP_PASSWORD")
+OPR_API_KEY  = os.getenv("OPR_API_KEY", "")
+GCP_CREDS    = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+WHOISXML_KEY = os.getenv("WHOISXML_API_KEY", "")
 
 HEADERS = {
     "User-Agent": (
@@ -88,52 +86,9 @@ def ensure_sheets(sh):
             ws.append_row(headers)
             log.info(f"Feuille créée : {name}")
 
-# ─── Source 1A : WhoisXML API — domaines expirés ──────────────────────────────
-# Gratuit : 500 requêtes/mois — https://www.whoisxmlapi.com
-
-def fetch_expired_domains_whoisxml(keyword: str) -> list[dict]:
-    domains = []
-    for ext in [".com", ".io", ".fr"]:
-        tld = ext.replace(".", "")
-        try:
-            r = requests.post(
-                "https://domain-research.whoisxmlapi.com/api/v1",
-                json={
-                    "apiKey": WHOISXML_KEY,
-                    "searchType": "current",
-                    "mode": "purchase",
-                    "basicSearchTerms": {"include": [keyword]},
-                    "filters": [
-                        {"field": "tld", "operator": "equals", "value": tld},
-                    ],
-                },
-                timeout=15,
-            )
-            for item in r.json().get("domainsList", [])[:8]:
-                domain_full = item.get("domainName", "")
-                if not domain_full:
-                    continue
-                name = domain_full.replace(ext, "")
-                domains.append({
-                    "domaine": name,
-                    "extension": ext,
-                    "prix_achat_estime": 12,
-                    "heures_encheres": 168,
-                    "lien_godaddy": f"https://www.godaddy.com/domainsearch/find?checkAvail=1&domainToCheck={domain_full}",
-                    "keyword_source": keyword,
-                })
-            time.sleep(1)
-        except Exception as e:
-            log.warning(f"WhoisXML error ({keyword}{ext}): {e}")
-    return domains
-
-# ─── Source 1B : Fallback RDAP — disponibilité sans API payante ───────────────
+# ─── Source 1 : RDAP — disponibilité domaines ─────────────────────────────────
 
 def fetch_expired_domains_fallback(keyword: str) -> list[dict]:
-    """
-    Génère des combinaisons domaine + mot-clé et vérifie la disponibilité
-    via l'API RDAP publique (aucune clé requise, légal).
-    """
     prefixes = ["get", "my", "use", "go", "the", "pro", "be", ""]
     suffixes = ["hq", "app", "hub", "ai", "pro", "ly", "now", ""]
     domains  = []
@@ -157,11 +112,14 @@ def fetch_expired_domains_fallback(keyword: str) -> list[dict]:
             )
             if r.status_code == 404:
                 domains.append({
-                    "domaine": name,
-                    "extension": ext,
+                    "domaine":           name,
+                    "extension":         ext,
                     "prix_achat_estime": 12,
-                    "heures_encheres": 720,
-                    "lien_godaddy": f"https://www.godaddy.com/domainsearch/find?checkAvail=1&domainToCheck={domain_full}",
+                    "heures_encheres":   720,
+                    "lien_godaddy":      (
+                        f"https://www.godaddy.com/domainsearch/find"
+                        f"?checkAvail=1&domainToCheck={domain_full}"
+                    ),
                     "keyword_source": keyword,
                 })
             time.sleep(0.5)
@@ -171,12 +129,13 @@ def fetch_expired_domains_fallback(keyword: str) -> list[dict]:
     log.info(f"Fallback RDAP ({keyword}) → {len(domains)} domaines disponibles")
     return domains
 
-# ─── Source 2 : Namebio — historique de ventes ────────────────────────────────
+# ─── Source 2 : Namebio — historique ventes ───────────────────────────────────
 
 def fetch_namebio_sales(keyword: str) -> list[dict]:
     sales = []
     try:
-        r    = requests.get(f"https://namebio.com/?s={keyword}", headers=HEADERS, timeout=15)
+        r    = requests.get(f"https://namebio.com/?s={keyword}",
+                            headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
         for row in soup.select("table.table tbody tr")[:10]:
             cols  = row.find_all("td")
@@ -184,38 +143,77 @@ def fetch_namebio_sales(keyword: str) -> list[dict]:
                 continue
             price = parse_price(cols[1].get_text(strip=True))
             if price > 0:
-                sales.append({"price": price, "date": cols[2].get_text(strip=True)})
+                sales.append({"price": price,
+                               "date": cols[2].get_text(strip=True)})
     except Exception as e:
         log.warning(f"Namebio error ({keyword}): {e}")
     return sales
 
-# ─── Source 3 : Google Trends — avec retry et backoff ─────────────────────────
+# ─── Source 3 : Google Trends — sans pytrends (HTTP direct) ───────────────────
+# pytrends est incompatible avec les versions récentes de urllib3 sur GitHub Actions
+# On appelle l'API non-officielle Google Trends directement
 
 def get_trend_score(keyword: str) -> int:
-    kw      = keyword.replace("-", " ")
-    retries = 3
-    for attempt in range(retries):
-        try:
-            pt = TrendReq(hl="fr-FR", tz=60, timeout=(10, 25),
-                          retries=2, backoff_factor=0.5)
-            pt.build_payload([kw], cat=0, timeframe="today 3-m", geo="")
-            df = pt.interest_over_time()
-            if df.empty:
-                return 0
-            avg   = int(df[kw].mean())
-            delta = int(df[kw].iloc[-4:].mean() - df[kw].iloc[:4].mean())
-            return min(100, avg + max(0, delta * 2))
-        except Exception as e:
-            if "429" in str(e) and attempt < retries - 1:
-                wait = (2 ** attempt) * 10 + random.randint(5, 15)
-                log.warning(f"Trends 429 ({keyword}) — attente {wait}s")
-                time.sleep(wait)
-            else:
-                log.warning(f"Trends error ({keyword}): {e}")
-                return 0
-    return 0
+    """
+    Appel direct à l'API Google Trends (sans pytrends).
+    Retourne un score 0-100.
+    """
+    kw = keyword.replace("-", " ")
+    try:
+        # Étape 1 : obtenir le cookie et le token
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        r1 = session.get(
+            "https://trends.google.com/trends/explore",
+            params={"q": kw, "date": "today 3-m", "geo": "", "hl": "fr"},
+            timeout=15
+        )
+        # Étape 2 : appel données
+        time.sleep(1)
+        r2 = session.get(
+            "https://trends.google.com/trends/api/explore",
+            params={
+                "hl": "fr", "tz": -60, "req": json.dumps({
+                    "comparisonItem": [{"keyword": kw, "geo": "", "time": "today 3-m"}],
+                    "category": 0, "property": ""
+                })
+            },
+            timeout=15
+        )
+        # Réponse protégée par ")]}',\n"
+        raw  = r2.text.lstrip(")]}'").strip()
+        data = json.loads(raw)
+        token = data["widgets"][0]["token"]
+        req   = data["widgets"][0]["request"]
 
-# ─── Source 4 : OpenPageRank — backlinks ──────────────────────────────────────
+        time.sleep(1)
+        r3 = session.get(
+            "https://trends.google.com/trends/api/widgetdata/multiline",
+            params={
+                "hl": "fr", "tz": -60,
+                "req": json.dumps(req),
+                "token": token
+            },
+            timeout=15
+        )
+        raw3   = r3.text.lstrip(")]}'").strip()
+        data3  = json.loads(raw3)
+        values = [
+            pt["value"][0]
+            for pt in data3["default"]["timelineData"]
+            if pt.get("value")
+        ]
+        if not values:
+            return 0
+        avg   = sum(values) / len(values)
+        delta = sum(values[-4:]) / 4 - sum(values[:4]) / 4
+        return min(100, int(avg + max(0, delta * 2)))
+
+    except Exception as e:
+        log.warning(f"Trends error ({keyword}): {e}")
+        return 0
+
+# ─── Source 4 : OpenPageRank ──────────────────────────────────────────────────
 
 def get_backlinks_score(domain_full: str) -> tuple[int, int]:
     if not OPR_API_KEY:
@@ -227,10 +225,10 @@ def get_backlinks_score(domain_full: str) -> tuple[int, int]:
             headers={"API-OPR": OPR_API_KEY},
             timeout=10,
         )
-        data = r.json()
-        rank = data["response"][0].get("page_rank_integer", 0)
-        bl   = data["response"][0].get("rank", 0)
-        return min(100, rank * 12), bl
+        data  = r.json()
+        rank  = data["response"][0].get("page_rank_integer") or 0
+        bl    = data["response"][0].get("rank") or 0
+        return min(100, int(rank) * 12), int(bl)
     except Exception as e:
         log.warning(f"OPR error ({domain_full}): {e}")
         return 0, 0
@@ -270,17 +268,21 @@ def score_domain(domain: dict, sales: list[dict], trend: int) -> dict:
         s_acheteur = 65
     else:
         s_acheteur = 35
-    if ext == ".com":   s_acheteur = min(100, s_acheteur + 10)
-    elif ext in (".io", ".ai"): s_acheteur = min(100, s_acheteur + 5)
+    if ext == ".com":
+        s_acheteur = min(100, s_acheteur + 10)
+    elif ext in (".io", ".ai"):
+        s_acheteur = min(100, s_acheteur + 5)
 
     # Demande (20%)
-    s_demande = trend
+    s_demande = int(trend) if trend else 0
 
-    # SEO (15%)
-    s_seo, nb_backlinks = get_backlinks_score(name + ext)
+    # SEO (15%) — protection NoneType
+    seo_raw, bl_raw = get_backlinks_score(name + ext)
+    s_seo       = int(seo_raw) if seo_raw else 0
+    nb_backlinks = int(bl_raw) if bl_raw else 0
 
     # Timing (10%)
-    h = domain["heures_encheres"]
+    h = domain.get("heures_encheres", 720)
     if h <= 24:    s_timing = 100
     elif h <= 48:  s_timing = 80
     elif h <= 72:  s_timing = 60
@@ -358,15 +360,13 @@ def send_alert(opportunities: list[dict]):
       <h2 style="color:#1a1a1a">Opportunités domaines — score > {SCORE_ALERT}</h2>
       <p style="color:#666">Scan du {datetime.now().strftime('%d/%m/%Y à %Hh%M')}</p>
       <table style="width:100%;border-collapse:collapse">
-        <thead>
-          <tr style="background:#f5f5f5">
-            <th style="padding:8px;text-align:left">Domaine</th>
-            <th style="padding:8px">Score</th>
-            <th style="padding:8px">Prix achat</th>
-            <th style="padding:8px;text-align:left">Rationale</th>
-            <th style="padding:8px">Lien</th>
-          </tr>
-        </thead>
+        <thead><tr style="background:#f5f5f5">
+          <th style="padding:8px;text-align:left">Domaine</th>
+          <th style="padding:8px">Score</th>
+          <th style="padding:8px">Prix achat</th>
+          <th style="padding:8px;text-align:left">Rationale</th>
+          <th style="padding:8px">Lien</th>
+        </tr></thead>
         <tbody>{rows}</tbody>
       </table>
       <p style="color:#999;font-size:12px;margin-top:20px">
@@ -393,7 +393,7 @@ def send_alert(opportunities: list[dict]):
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
-    log.info("=== Démarrage scan domain agent v2 ===")
+    log.info("=== Démarrage scan domain agent v3 ===")
     sh = get_sheet()
     ensure_sheets(sh)
     ws = sh.worksheet("opportunites")
@@ -404,18 +404,12 @@ def run():
     for kw in KEYWORDS:
         log.info(f"Traitement keyword : {kw}")
 
-        # Source 1 : domaines disponibles
-        if WHOISXML_KEY:
-            domains = fetch_expired_domains_whoisxml(kw)
-        else:
-            domains = fetch_expired_domains_fallback(kw)
+        domains = fetch_expired_domains_fallback(kw)
+        sales   = fetch_namebio_sales(kw)
 
-        # Source 2 : historique ventes
-        sales = fetch_namebio_sales(kw)
-
-        # Source 3 : tendance (pause anti-429)
-        time.sleep(random.randint(8, 15))
+        time.sleep(random.randint(3, 6))
         trend = get_trend_score(kw)
+        log.info(f"Trend score ({kw}) : {trend}")
 
         for d in domains:
             key = d["domaine"] + d["extension"]
@@ -427,6 +421,7 @@ def run():
         time.sleep(2)
 
     all_domains.sort(key=lambda x: x["score_global"], reverse=True)
+    log.info(f"Total domaines scorés : {len(all_domains)}")
 
     now           = datetime.now().strftime("%Y-%m-%d %H:%M")
     rows_to_write = []
@@ -443,7 +438,7 @@ def run():
         ws.append_rows(rows_to_write, value_input_option="RAW")
         log.info(f"{len(rows_to_write)} opportunités écrites dans Google Sheets")
     else:
-        log.warning("Aucun domaine trouvé — vérifie les sources de données")
+        log.warning("Aucun domaine trouvé")
 
     top_alerts = [o for o in all_domains if o["score_global"] >= SCORE_ALERT]
     if top_alerts:
