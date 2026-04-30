@@ -3,16 +3,16 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Domain Agent — Dashboard</title>
+<title>Card Agent — Dashboard</title>
 <style>
   :root {
     --bg: #fafafa; --surface: #fff; --border: #e8e8e8;
     --text: #1a1a1a; --muted: #888; --accent: #185FA5;
     --green-bg: #EAF3DE; --green-text: #27500A;
     --amber-bg: #FAEEDA; --amber-text: #633806;
-    --gray-bg:  #F1EFE8; --gray-text:  #444441;
-    --orange-bg: #FEF0E6; --orange-text: #C45200;
-    --blue-bg: #E8F0FB; --blue-text: #1a4a8a;
+    --gray-bg: #F1EFE8; --gray-text: #444441;
+    --dbz-bg: #FEF3E6; --dbz-text: #B45309;
+    --ygo-bg: #E8F0FB; --ygo-text: #1a4a8a;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -27,11 +27,12 @@
              gap: 12px; padding: 20px 24px 0; }
   .metric { background: var(--surface); border: 1px solid var(--border);
             border-radius: 10px; padding: 14px 16px; }
+  .metric.dbz { border-color: #f0a860; }
+  .metric.ygo { border-color: #7faade; }
   .metric .label { font-size: 11px; color: var(--muted); text-transform: uppercase;
                    letter-spacing: .5px; margin-bottom: 6px; }
   .metric .value { font-size: 24px; font-weight: 600; }
-  .metric .sub   { font-size: 11px; color: var(--muted); margin-top: 3px; }
-  .metric.highlight { border-color: #f0a860; background: #fffaf5; }
+  .metric .sub { font-size: 11px; color: var(--muted); margin-top: 3px; }
 
   .section { padding: 20px 24px; }
   .section h2 { font-size: 14px; font-weight: 600; margin-bottom: 12px;
@@ -39,13 +40,14 @@
   .badge-count { background: var(--accent); color: #fff; border-radius: 20px;
                  padding: 1px 8px; font-size: 11px; }
 
-  .filters { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
+  .filters { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
   .filter-btn { padding: 5px 12px; border: 1px solid var(--border);
                 border-radius: 20px; font-size: 12px; cursor: pointer;
                 background: var(--surface); color: var(--text); transition: all 0.15s; }
-  .filter-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .filter-btn:hover { border-color: var(--accent); }
   .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .filter-sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+  .filter-btn.dbz-btn.active { background: #B45309; border-color: #B45309; }
+  .filter-btn.ygo-btn.active { background: #1a4a8a; border-color: #1a4a8a; }
 
   table { width: 100%; border-collapse: collapse; background: var(--surface);
           border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
@@ -56,21 +58,20 @@
   th:hover { color: var(--text); }
   td { padding: 10px 12px; border-top: 1px solid var(--border); vertical-align: middle; }
   tr:hover td { background: #f9f9f9; }
-  tr.row-expirant td { border-left: 3px solid #f0a860; }
-  tr.row-disponible td { border-left: 3px solid #c8e6c9; }
+  tr.row-dbz td { border-left: 3px solid #f0a860; }
+  tr.row-ygo td { border-left: 3px solid #7faade; }
 
-  /* Type tag */
-  .type-tag { display: inline-flex; align-items: center; gap: 4px;
-              padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;
-              white-space: nowrap; }
-  .type-expirant  { background: var(--orange-bg); color: var(--orange-text); }
-  .type-disponible { background: var(--blue-bg); color: var(--blue-text); }
-  .type-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .univ-tag { display: inline-block; padding: 2px 8px; border-radius: 4px;
+              font-size: 11px; font-weight: 600; }
+  .tag-dbz { background: var(--dbz-bg); color: var(--dbz-text); }
+  .tag-ygo { background: var(--ygo-bg); color: var(--ygo-text); }
 
-  .domain-name { font-weight: 600; font-size: 14px; }
-  .domain-ext  { color: var(--muted); font-size: 12px; }
-  .domain-meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
-  .enchere-date { font-size: 11px; color: var(--orange-text); font-weight: 500; margin-top: 2px; }
+  .titre { font-weight: 500; font-size: 13px; max-width: 260px;
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .kw-tags { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 4px; }
+  .kw { background: var(--gray-bg); color: var(--gray-text); border-radius: 3px;
+        padding: 1px 5px; font-size: 10px; }
+  .kw.high { background: var(--green-bg); color: var(--green-text); }
 
   .score { display: inline-block; padding: 3px 10px; border-radius: 20px;
            font-size: 12px; font-weight: 600; }
@@ -82,22 +83,23 @@
   .bar.filled { background: var(--accent); }
 
   .ratio { font-size: 16px; font-weight: 700; color: var(--accent); }
-  .price-est { font-weight: 600; color: #27500A; }
+  .marge { font-size: 12px; font-weight: 600; }
+  .marge.good { color: #27500A; }
+  .marge.ok   { color: #633806; }
 
-  .dims { font-size: 11px; color: var(--muted); line-height: 1.8; }
-  .dims span { color: var(--text); font-weight: 500; }
+  .price-buy  { font-weight: 700; font-size: 15px; }
+  .price-ref  { font-size: 12px; color: var(--muted); }
+  .price-arr  { color: var(--muted); margin: 0 3px; }
 
-  .rationale { font-size: 12px; color: var(--muted); max-width: 240px; line-height: 1.5; }
+  .etat { font-size: 11px; color: var(--muted); }
+  .rationale { font-size: 11px; color: var(--muted); max-width: 200px; line-height: 1.5; }
 
   .link-btn { display: inline-block; padding: 4px 10px; border: 1px solid var(--border);
               border-radius: 6px; font-size: 12px; color: var(--accent);
               text-decoration: none; white-space: nowrap; }
-  .link-btn:hover { background: #f0f7ff; border-color: var(--accent); }
-  .link-btn.expirant { border-color: #f0a860; color: var(--orange-text); }
-  .link-btn.expirant:hover { background: var(--orange-bg); }
+  .link-btn:hover { background: #f0f7ff; }
 
   .empty { text-align: center; padding: 40px; color: var(--muted); font-size: 14px; }
-
   .last-scan { font-size: 12px; color: var(--muted); }
   .refresh-btn { font-size: 12px; padding: 4px 10px; cursor: pointer;
                  border: 1px solid var(--border); border-radius: 6px;
@@ -111,19 +113,14 @@
   .tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 500; }
   .tab-content { display: none; }
   .tab-content.active { display: block; }
-
-  .legend { display: flex; gap: 16px; align-items: center;
-            font-size: 11px; color: var(--muted); margin-left: auto; }
-  .legend-item { display: flex; align-items: center; gap: 5px; }
-  .legend-dot { width: 10px; height: 10px; border-radius: 2px; }
 </style>
 </head>
 <body>
 
 <header>
   <div>
-    <h1>Domain Agent</h1>
-    <p>Opportunités — domaines expirants &amp; disponibles</p>
+    <h1>Card Agent</h1>
+    <p>DBZ années 90 · Yu-Gi-Oh! anciennes séries — opportunités Vinted</p>
   </div>
   <div style="display:flex;align-items:center">
     <span class="last-scan" id="last-scan">—</span>
@@ -137,68 +134,55 @@
     <div class="value" id="m-total">—</div>
     <div class="sub">ce scan</div>
   </div>
-  <div class="metric highlight">
-    <div class="label">⚡ Expirants</div>
-    <div class="value" id="m-expirant">—</div>
-    <div class="sub">enchères en cours</div>
+  <div class="metric dbz">
+    <div class="label">🔥 DBZ</div>
+    <div class="value" id="m-dbz">—</div>
+    <div class="sub">annonces détectées</div>
   </div>
-  <div class="metric">
-    <div class="label">○ Disponibles</div>
-    <div class="value" id="m-disponible">—</div>
-    <div class="sub">achat direct 12€</div>
+  <div class="metric ygo">
+    <div class="label">⚔️ Yu-Gi-Oh!</div>
+    <div class="value" id="m-ygo">—</div>
+    <div class="sub">annonces détectées</div>
   </div>
   <div class="metric">
     <div class="label">Meilleur ratio</div>
     <div class="value" id="m-ratio">—</div>
-    <div class="sub">valeur / prix</div>
+    <div class="sub">prix annonce / marché</div>
   </div>
   <div class="metric">
-    <div class="label">Score ≥ 65</div>
+    <div class="label">Score ≥ 70</div>
     <div class="value" id="m-high">—</div>
     <div class="sub">haute conviction</div>
   </div>
 </div>
 
-<div class="tabs">
+<div class="tabs" style="margin-top:20px">
   <div class="tab active" onclick="switchTab('opps',this)">Opportunités</div>
   <div class="tab" onclick="switchTab('port',this)">Portefeuille</div>
 </div>
 
 <div id="tab-opps" class="tab-content active">
   <div class="section">
-    <h2>
-      Top opportunités
-      <span class="badge-count" id="badge-count">0</span>
-      <div class="legend">
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#f0a860"></div> Expirant
-        </div>
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#c8e6c9"></div> Disponible
-        </div>
-      </div>
-    </h2>
+    <h2>Annonces sous-évaluées <span class="badge-count" id="badge-count">0</span></h2>
     <div class="filters">
-      <button class="filter-btn active" onclick="setFilter('all',this)">Tous</button>
-      <button class="filter-btn" onclick="setFilter('expirant',this)">⚡ Expirants uniquement</button>
-      <button class="filter-btn" onclick="setFilter('disponible',this)">○ Disponibles uniquement</button>
-      <div class="filter-sep"></div>
-      <button class="filter-btn" onclick="setFilter('high',this)">Score ≥ 65</button>
-      <button class="filter-btn" onclick="setFilter('ratio',this)">Ratio ≥ x20</button>
-      <button class="filter-btn" onclick="setFilter('com',this)">.com</button>
-      <button class="filter-btn" onclick="setFilter('io',this)">.io / .ai</button>
+      <button class="filter-btn active" onclick="setFilter('all',this)">Toutes</button>
+      <button class="filter-btn dbz-btn" onclick="setFilter('dbz',this)">🔥 DBZ uniquement</button>
+      <button class="filter-btn ygo-btn" onclick="setFilter('ygo',this)">⚔️ YGO uniquement</button>
+      <button class="filter-btn" onclick="setFilter('high',this)">Score ≥ 70</button>
+      <button class="filter-btn" onclick="setFilter('ratio',this)">Ratio ≥ x2</button>
+      <button class="filter-btn" onclick="setFilter('marge',this)">Marge ≥ 40%</button>
     </div>
     <table>
       <thead>
         <tr>
           <th>Type</th>
-          <th onclick="sortBy('domaine')">Domaine</th>
+          <th onclick="sortBy('titre')">Article</th>
           <th onclick="sortBy('score_global')">Score ↓</th>
           <th onclick="sortBy('ratio_x')">Ratio</th>
-          <th onclick="sortBy('prix_achat')">Prix achat</th>
-          <th onclick="sortBy('valeur_estimee')">Valeur est.</th>
-          <th>Dimensions</th>
-          <th>Rationale</th>
+          <th onclick="sortBy('prix_annonce')">Prix → Marché</th>
+          <th onclick="sortBy('marge_estimee')">Marge</th>
+          <th>Mots-clés valeur</th>
+          <th>État</th>
           <th></th>
         </tr>
       </thead>
@@ -212,17 +196,14 @@
 <div id="tab-port" class="tab-content">
   <div style="padding:40px 24px;text-align:center;color:var(--muted);font-size:13px;line-height:2">
     Remplis l'onglet <strong>portefeuille</strong> dans Google Sheets après chaque achat.<br>
-    <span style="color:#bbb">date_achat · domaine · prix_achat · plateforme · prix_demande · statut · date_vente · prix_vente · pnl</span>
+    <span style="color:#bbb">date_achat · univers · article · prix_achat · plateforme_vente · prix_revente · statut · date_vente · prix_vente · pnl</span>
   </div>
 </div>
 
 <script>
-const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQsLvbiZabWukhGD--m3Y5tt2B3NW2uPy1yAPRPQ8hvwANQaHzuLsfQbPMJnOKGEZluL7Eilp2k4Esq/pub?gid=0&single=true&output=csv";
+const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRhBCDf2hUffMPrhpeCpqe_WlbnxhML2k7kWBnH_hYMjZNP_nPEQWIE8-qBL7WKpZyqH6qYjLVvwxtJ/pub?gid=0&single=true&output=csv";
 
-let allData      = [];
-let activeFilter = "all";
-let sortField    = "score_global";
-let sortDir      = -1;
+let allData = [], activeFilter = "all", sortField = "score_global", sortDir = -1;
 
 async function loadData() {
   document.getElementById("last-scan").textContent = "Chargement...";
@@ -234,15 +215,14 @@ async function loadData() {
     const headers = rows[0].map(h => h.trim());
     allData = rows.slice(1)
       .map(row => { const o={}; headers.forEach((h,i)=>o[h]=(row[i]||"").trim()); return o; })
-      .filter(o => o.domaine);
+      .filter(o => o.titre);
     render();
     updateMetrics();
     document.getElementById("last-scan").textContent =
       "Dernier scan : " + (allData[0]?.date_scan || "—");
   } catch(e) {
-    showEmpty("Erreur de chargement");
+    showEmpty("Erreur de chargement — configure l'URL CSV");
     document.getElementById("last-scan").textContent = "Erreur";
-    console.error(e);
   }
 }
 
@@ -273,16 +253,15 @@ function sortBy(f) {
 
 function getFiltered() {
   return allData.filter(o => {
-    const sc   = parseFloat(o.score_global)||0;
-    const rx   = parseFloat(o.ratio_x)||0;
-    const ex   = o.extension||"";
-    const type = (o.type||"").toUpperCase();
-    if(activeFilter==="expirant")   return type==="EXPIRANT";
-    if(activeFilter==="disponible") return type==="DISPONIBLE";
-    if(activeFilter==="high")       return sc>=65;
-    if(activeFilter==="ratio")      return rx>=20;
-    if(activeFilter==="com")        return ex===".com";
-    if(activeFilter==="io")         return ex===".io"||ex===".ai";
+    const sc  = parseFloat(o.score_global)||0;
+    const rx  = parseFloat(o.ratio_x)||0;
+    const mg  = parseFloat(o.marge_estimee)||0;
+    const unv = (o.univers||"").toUpperCase();
+    if(activeFilter==="dbz")   return unv==="DBZ";
+    if(activeFilter==="ygo")   return unv==="YGO";
+    if(activeFilter==="high")  return sc>=70;
+    if(activeFilter==="ratio") return rx>=2;
+    if(activeFilter==="marge") return mg>=40;
     return true;
   }).sort((a,b) => {
     const av=parseFloat(a[sortField])||0, bv=parseFloat(b[sortField])||0;
@@ -291,15 +270,13 @@ function getFiltered() {
 }
 
 function scoreClass(s) {
-  if(s>=65) return "score-high";
-  if(s>=45) return "score-mid";
+  if(s>=70) return "score-high";
+  if(s>=50) return "score-mid";
   return "score-low";
 }
 function scoreBars(s) {
-  const n = Math.round(s/20);
-  return Array.from({length:5},(_,i)=>
-    `<div class="bar${i<n?" filled":""}"></div>`
-  ).join("");
+  const n=Math.round(s/20);
+  return Array.from({length:5},(_,i)=>`<div class="bar${i<n?" filled":""}"></div>`).join("");
 }
 
 function render() {
@@ -311,56 +288,47 @@ function render() {
     return;
   }
   document.getElementById("opp-tbody").innerHTML = data.map(o => {
-    const sc    = parseFloat(o.score_global)||0;
-    const rx    = parseFloat(o.ratio_x)||0;
-    const val   = parseInt(o.valeur_estimee)||0;
-    const prix  = parseInt(o.prix_achat)||12;
-    const dem   = parseInt(o.demande_mot_cle)||0;
-    const trn   = parseInt(o.tendance)||0;
-    const sr    = parseInt(o.score_ratio)||0;
-    const seo   = parseInt(o.score_seo)||0;
-    const type  = (o.type||"DISPONIBLE").toUpperCase();
-    const isExp = type === "EXPIRANT";
+    const sc   = parseFloat(o.score_global)||0;
+    const rx   = parseFloat(o.ratio_x)||0;
+    const mg   = parseFloat(o.marge_estimee)||0;
+    const prix = parseFloat(o.prix_annonce)||0;
+    const ref  = parseFloat(o.prix_marche_ref)||0;
+    const unv  = (o.univers||"").toUpperCase();
+    const isDBZ = unv==="DBZ";
 
-    const typeTag = isExp
-      ? `<span class="type-tag type-expirant"><span class="type-dot"></span>⚡ EXPIRANT</span>`
-      : `<span class="type-tag type-disponible"><span class="type-dot"></span>○ DISPONIBLE</span>`;
+    const kws = (o.mots_cles_valeur||"").split(",").filter(k=>k.trim());
+    const kwHtml = kws.slice(0,4).map(k=>
+      `<span class="kw high">${k.trim()}</span>`
+    ).join("");
 
-    const enchereLine = isExp && o.date_fin_enchere
-      ? `<div class="enchere-date">Enchère : ${o.date_fin_enchere}</div>`
-      : "";
-
-    const prixLine = isExp && o.prix_enchere > 0
-      ? `<span style="color:var(--orange-text);font-weight:600">${o.prix_enchere}€</span> <span style="color:var(--muted);font-size:11px">(enchère)</span>`
-      : `<span style="font-weight:600">${prix}€</span> <span style="color:var(--muted);font-size:11px">(enreg.)</span>`;
-
-    return `<tr class="${isExp?'row-expirant':'row-disponible'}">
-      <td>${typeTag}</td>
+    return `<tr class="${isDBZ?'row-dbz':'row-ygo'}">
       <td>
-        <div class="domain-name">${o.domaine}<span class="domain-ext">${o.extension}</span></div>
-        <div class="domain-meta">${o.mot_cle_source||""}</div>
-        ${enchereLine}
+        <span class="univ-tag ${isDBZ?'tag-dbz':'tag-ygo'}">
+          ${isDBZ?'🔥 DBZ':'⚔️ YGO'}
+        </span>
+      </td>
+      <td>
+        <div class="titre" title="${o.titre}">${o.titre}</div>
+        <div class="kw-tags">${kwHtml}</div>
       </td>
       <td>
         <span class="score ${scoreClass(sc)}">${sc}/100</span>
         <div class="score-bars">${scoreBars(sc)}</div>
       </td>
       <td><div class="ratio">x${rx||"—"}</div></td>
-      <td>${prixLine}</td>
-      <td><span class="price-est">~${val?val+"€":"—"}</span></td>
       <td>
-        <div class="dims">
-          Dem <span>${dem}</span> · Trnd <span>${trn}</span><br>
-          Ratio <span>${sr}</span> · SEO <span>${seo}</span>
-        </div>
+        <span class="price-buy">${prix?prix+"€":"—"}</span>
+        <span class="price-arr">→</span>
+        <span class="price-ref">~${ref?ref+"€":"?"}</span>
       </td>
-      <td><div class="rationale">${o.rationale||"—"}</div></td>
       <td>
-        <a href="${o.lien_achat}" target="_blank"
-           class="link-btn${isExp?' expirant':''}">
-          ${isExp?"Enchérir →":"Acheter →"}
-        </a>
+        <span class="marge ${mg>=40?'good':'ok'}">
+          ${mg?"+"+mg+"%":"—"}
+        </span>
       </td>
+      <td><div style="font-size:11px;color:var(--muted)">${o.mots_cles_valeur||"—"}</div></td>
+      <td><span class="etat">${o.etat||"—"}</span></td>
+      <td><a href="${o.lien_annonce}" target="_blank" class="link-btn">Voir →</a></td>
     </tr>`;
   }).join("");
 }
@@ -371,18 +339,17 @@ function showEmpty(msg) {
 }
 
 function updateMetrics() {
-  const total     = allData.length;
-  const expirants = allData.filter(o=>(o.type||"").toUpperCase()==="EXPIRANT").length;
-  const dispos    = allData.filter(o=>(o.type||"").toUpperCase()==="DISPONIBLE").length;
-  const ratios    = allData.map(o=>parseFloat(o.ratio_x)||0).filter(r=>r>0);
-  const best      = ratios.length ? "x"+Math.max(...ratios) : "—";
-  const high      = allData.filter(o=>(parseFloat(o.score_global)||0)>=65).length;
-
-  document.getElementById("m-total").textContent     = total||"—";
-  document.getElementById("m-expirant").textContent  = expirants||"0";
-  document.getElementById("m-disponible").textContent= dispos||"0";
-  document.getElementById("m-ratio").textContent     = best;
-  document.getElementById("m-high").textContent      = high||"—";
+  const total = allData.length;
+  const dbz   = allData.filter(o=>(o.univers||"").toUpperCase()==="DBZ").length;
+  const ygo   = allData.filter(o=>(o.univers||"").toUpperCase()==="YGO").length;
+  const ratios= allData.map(o=>parseFloat(o.ratio_x)||0).filter(r=>r>0);
+  const best  = ratios.length ? "x"+Math.max(...ratios).toFixed(1) : "—";
+  const high  = allData.filter(o=>(parseFloat(o.score_global)||0)>=70).length;
+  document.getElementById("m-total").textContent = total||"—";
+  document.getElementById("m-dbz").textContent   = dbz||"0";
+  document.getElementById("m-ygo").textContent   = ygo||"0";
+  document.getElementById("m-ratio").textContent = best;
+  document.getElementById("m-high").textContent  = high||"—";
 }
 
 function switchTab(name, btn) {
