@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 SCORE_ALERT    = 65
-MAX_RDAP       = 30    # nb max de vérifications RDAP par run — évite les timeouts
+MAX_RDAP       = 50    # nb max de vérifications RDAP par run — évite les timeouts
 MAX_SCORED     = 40    # nb max de domaines scorés par run
 
 SHEET_NAME  = os.getenv("GOOGLE_SHEET_NAME", "Domain Agent")
@@ -52,7 +52,7 @@ SEED_KEYWORDS = [
     "invest", "saas", "crypto", "digital", "code", "app",
 ]
 
-TARGET_EXTENSIONS = [".com", ".io", ".ai", ".co", ".fr"]
+TARGET_EXTENSIONS = [".com", ".com", ".io", ".ai", ".fr"]
 
 # Valeur de base par extension (€) — basé sur moyennes marché
 EXT_BASE = {".com": 600, ".io": 350, ".ai": 500, ".co": 200, ".fr": 150}
